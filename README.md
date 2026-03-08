@@ -1,317 +1,224 @@
-# Genome Scoring Pipeline (jan26_drops)
+# Genomic Diversity: Entropy-based functional element detection with Evo 2
 
-Statistical drop detection in genomic sequences using Evo2 language model.
+This pipeline uses the [Evo 2](https://github.com/ArcInstitute/evo2) DNA language model to identify functional genomic elements through entropy analysis. Evo 2 scores DNA sequences at single-nucleotide resolution; regions where the model shows high confidence (low entropy) often correspond to biologically significant elements such as exons, regulatory regions, and conserved domains.
 
----
+## Contents
 
-## Quick Start
+- [Overview](#overview)
+- [Pipeline](#pipeline)
+- [Setup](#setup)
+- [Usage](#usage)
+  - [1. Score a Chromosome](#1-score-a-chromosome)
+  - [2. Analyze Results](#2-analyze-results)
+  - [3. SAE Feature Analysis](#3-sae-feature-analysis)
+- [Output Structure](#output-structure)
+- [Supported Organisms](#supported-organisms)
+- [Repository Structure](#repository-structure)
+- [Citation](#citation)
+
+## Overview
+
+Evo 2 is a 7B+ parameter DNA language model trained on 8.8 trillion tokens across all domains of life. When scoring a genome, positions where the model is highly confident (low entropy) tend to be functionally important — the model has "learned" these patterns from evolutionary data.
+
+This pipeline:
+1. **Scores** entire chromosomes with Evo 2, producing per-position entropy values
+2. **Detects** statistically significant entropy drops using robust methods (MAD, z-score)
+3. **Pairs** drop and rise boundaries to define complete low-entropy regions
+4. **Analyzes** detected regions with Evo 2's Sparse Autoencoder (SAE) to identify which biological features are activated
+5. **Visualizes** results with publication-quality plots and dashboards
+
+## Pipeline
+
+```
+Chromosome FASTA
+       │
+       ▼
+┌──────────────────┐
+│ score_chromosome  │  GPU scoring with Evo 2
+│     .py           │  → per-position entropy
+└────────┬─────────┘
+         │
+    ┌────┴────┐
+    ▼         ▼
+ drops     entropy
+ .tsv      .npz
+    │         │
+    ▼         ▼
+┌──────────────────┐     ┌──────────────────────┐
+│ analyze_scoring  │     │ run_sae_on_chromosome │
+│ _results.py      │     │ _drops.py             │
+│ → plots,         │     │ → SAE feature         │
+│   dashboards     │     │   analysis            │
+└──────────────────┘     └──────────────────────┘
+```
+
+## Setup
+
+### Requirements
+
+- Linux with CUDA 12.1+ and a supported NVIDIA GPU
+- Python 3.11+ with conda
+- [Evo 2](https://github.com/ArcInstitute/evo2) installed (see their repo for instructions)
+
+### Environment Setup
 
 ```bash
-# 1. Activate environment
 module load miniforge/24.3.0-0
 conda activate evo2_sep28
-
-# 2. Run on a gene
-python genome_scoring_jan26_drops.py --organism ecoli --gene_id b0455
-
-# 3. View results
-cat b0455/data/b0455.drops.txt
-open b0455/plots/b0455.drops_zscore.png
 ```
 
----
-
-## Files in This Directory
-
-### 📌 Essential (Use These)
-
-| File | Purpose |
-|------|---------|
-| **`genome_scoring_jan26_drops.py`** | Main script - run this! |
-| **`README.md`** | This file - documentation |
-| **`CHANGELOG.md`** | Version history (jan22→jan24→jan26) |
-
-### 🔧 Tools (Optional)
-
-| File | Purpose | When to Use |
-|------|---------|-------------|
-| `tools/quick_parameter_test.py` | Find optimal thresholds | Too many/few drops detected |
-| `tools/benchmark_performance.py` | Test GPU speed | First time on new cluster |
-| `tools/run_benchmark.sh` | Submit benchmark to cluster | Performance testing |
-
-### 📁 Examples
-
-| File | Purpose |
-|------|---------|
-| `examples/run_single_gene.sh` | SLURM template for one gene |
-| `examples/run_batch.sh` | SLURM template for many genes |
-
-### 🗄️ Archive (Old Versions)
-
-| File | Purpose |
-|------|---------|
-| `archive/genome_scoring_jan24.py` | Previous version (organized outputs) |
-| `archive/genome_scoring_jan22.py` | Original version |
-
----
-
-## Directory Structure
-
-```
-jan22_files/
-├── genome_scoring_jan26_drops.py     ← MAIN SCRIPT
-├── README.md                         ← THIS FILE
-├── CHANGELOG.md                      ← Version history
-│
-├── tools/                            ← Optimization tools
-│   ├── quick_parameter_test.py       ← Find best thresholds
-│   ├── benchmark_performance.py      ← Test speed
-│   └── run_benchmark.sh              ← Submit benchmarks
-│
-├── examples/                         ← Job templates
-│   ├── run_single_gene.sh
-│   └── run_batch.sh
-│
-├── archive/                          ← Old versions
-│   ├── genome_scoring_jan24.py
-│   └── genome_scoring_jan22.py
-│
-└── <gene_id>/                        ← OUTPUT (created per gene)
-    ├── data/                         ← Scores and drops
-    ├── plots/                        ← Visualizations
-    ├── fasta/                        ← Sequences
-    └── metadata/                     ← Run info
-```
-
----
-
-## Usage Examples
-
-### Basic Run
+### SLURM (HPC Cluster)
 
 ```bash
-python genome_scoring_jan26_drops.py \
-    --organism ecoli \
-    --gene_id b0455
+# Interactive session with GPU
+salloc -t 48:00:00 -p mit_preemptable --gres=gpu:1 --cpus-per-task=8 --mem=100G
 ```
 
-### High Confidence (Fewer Drops)
+## Usage
+
+### 1. Score a Chromosome
+
+Score an entire chromosome (or a region) to compute per-position entropy and detect drop boundaries.
 
 ```bash
-python genome_scoring_jan26_drops.py \
-    --organism ecoli \
-    --gene_id b0455 \
+# Score human chromosome 22
+python score_chromosome.py --chrom NC_000022.11 --output_prefix chr22
+
+# Score a specific region
+python score_chromosome.py --chrom NC_000001.11 --start 1000000 --end 2000000
+
+# Score with custom thresholds
+python score_chromosome.py --chrom NC_000021.9 \
     --zscore_threshold 3.0 \
-    --mad_threshold 3.5 \
-    --min_separation 100
+    --mad_threshold 3.5
 ```
 
-### Sensitive Detection (More Drops)
+**Outputs:** `entropy.npz`, `drop_boundaries.tsv`, `drops.tsv`, `rises.tsv`, `summary.json`
+
+### 2. Analyze Results
+
+Generate visualizations and statistics from scoring results. Can run locally (no GPU needed).
 
 ```bash
-python genome_scoring_jan26_drops.py \
-    --organism ecoli \
-    --gene_id b0455 \
-    --zscore_threshold 2.0 \
-    --local_threshold 1.5
+# Basic text report
+python tools/analyze_scoring_results.py --auto chr22
+
+# Entropy profile plots
+python tools/analyze_scoring_results.py --auto chr22 --plot
+
+# Full plot suite with dashboard
+python tools/analyze_scoring_results.py --auto chr22 --all_plots --dashboard
+
+# Zoom into a specific region
+python tools/analyze_scoring_results.py --auto chr22 \
+    --plot --plot_start 20000000 --plot_end 25000000
 ```
 
-### Batch Processing
+### 3. SAE Feature Analysis
+
+Run Evo 2's Sparse Autoencoder on detected drop regions to identify which biological features (from 32K learned features) are activated.
 
 ```bash
-# Create gene list
-echo -e "b0455\nb2911\nb2621" > genes.txt
+# Analyze drop regions with SAE
+python run_sae_on_chromosome_drops.py --auto chr22
 
-# Submit array job
-sbatch --array=1-3 examples/run_batch.sh genes.txt
+# Custom parameters
+python run_sae_on_chromosome_drops.py --auto chr22 \
+    --max_regions 50 \
+    --confidence_threshold 8.0
 ```
 
----
+**Outputs:** Feature activation plots per region, signature features across regions, interactive notebooks.
 
-## Output Format
+## Output Structure
 
-### Drop File (`<gene>/data/<gene>.drops.txt`)
+All outputs are saved under `results/`, organized by chromosome and pipeline stage:
 
 ```
-zscore      150:-3.24,320:-2.87,487:-3.15
-mad         152:-3.45,322:-3.01
-local       148:-2.92,318:-2.54,485:-3.12
+results/
+  chr22/
+    scoring/
+      20260225_143012_rc_logprobs_4gpu/
+        data/          entropy.npz, drop_boundaries.tsv, drops.tsv, summary.json
+        logs/          scoring.log
+        COMPLETED      sentinel file (JSON)
+    sae/
+      20260305_110000_overlap_max50_conf8.0/
+        data/          sae_results.tsv, signature_features.tsv, feature_matrices.npz
+        plots/         region per-feature plots, signature summary
+        COMPLETED
+    visualization/
+      20260305_143000_analyze_scoring/
+        analysis.png, dashboard.png, zoom_plots/
+        COMPLETED
 ```
 
-**Format:** `method<TAB>pos:score,pos:score,...`
-
-**Interpretation:**
-- More negative score = higher confidence
-- `-3.0` or below = high confidence drop
-- `-2.5` to `-3.0` = medium confidence
-- Above `-2.5` = lower confidence
-
----
+Each completed run writes a `COMPLETED` JSON sentinel as its last action. Absence of this file indicates an interrupted run.
 
 ## Detection Methods
 
-### New Statistical Methods (Recommended)
-
 | Method | Default Threshold | Description |
-|--------|------------------|-------------|
-| **zscore** | 2.5 | Statistical significance (2.5σ ≈ 1% FDR) |
-| **mad** | 3.0 | Robust to outliers (uses median) |
+|--------|-------------------|-------------|
+| **z-score** | 2.5 | Statistical significance (2.5σ ≈ 1% FDR) |
+| **MAD** | 3.0 | Robust to outliers (uses median absolute deviation) |
 | **local** | 2.0 | Adapts to regional variance |
-| **bootstrap** | 0.50 | Highest confidence (⚠️ 100× slower) |
+| **bootstrap** | 0.50 | Highest confidence (100x slower) |
 
-### Legacy Methods (For Comparison)
+## Supported Organisms
 
-| Method | Description |
-|--------|-------------|
-| derivative | Bottom 1% of derivatives |
-| win_shift | Top-K window shifts |
-| cusum | Cumulative sum detection |
+| Organism | Genome Assembly |
+|----------|----------------|
+| Human | GRCh38 (GCF_000001405.26) |
+| *E. coli* K-12 | ASM584v2 (GCF_000005845.2) |
+| *B. subtilis* | ASM904v1 (GCF_000009045.1) |
 
-**Choose methods:**
-```bash
---detection_methods zscore mad           # Default (recommended)
---detection_methods zscore mad local     # More comprehensive
---detection_methods derivative zscore    # Compare legacy vs new
+## Repository Structure
+
+```
+├── score_chromosome.py             Main GPU scoring script
+├── run_sae_on_chromosome_drops.py  SAE analysis pipeline
+├── detection_methods.py            Drop detection algorithms
+├── sae_utils.py                    SAE helper functions
+├── results_utils.py                Output directory utilities
+├── analyze_sae_regions.py          SAE region analysis
+│
+├── tools/                          Analysis and benchmarking tools
+│   ├── analyze_scoring_results.py  Visualization and statistics
+│   ├── plot_sae_figure4.py         SAE figure generation
+│   ├── build_ground_truth.py       Ground truth from GTF annotations
+│   ├── map_drops_to_exons.py       Map detected drops to known exons
+│   ├── find_novel_regions.py       Identify unannotated detections
+│   ├── compare_detection_methods.py Method comparison
+│   ├── cross_organism_summary.py   Cross-species analysis
+│   ├── benchmark_performance.py    GPU performance benchmarks
+│   └── ...
+│
+├── scripts/                        SLURM job scripts and helpers
+│   ├── run_pipeline.sh             Full pipeline runner
+│   ├── ssh_connect.sh              SSH connection helper
+│   └── ...
+│
+├── archive/                        Previous script versions
+│   ├── genome_scoring_jan8.py
+│   ├── genome_scoring_jan22.py
+│   ├── genome_scoring_jan24.py
+│   └── genome_scoring_jan26_drops.py
+│
+├── examples/                       Example run scripts
+│
+└── results/                        Output data (not tracked)
 ```
 
----
+## Citation
 
-## Key Parameters
+This project builds on:
 
-| Parameter | Default | Description | Adjust If... |
-|-----------|---------|-------------|--------------|
-| `--zscore_threshold` | 2.5 | Z-score cutoff | Too many drops → increase |
-| `--mad_threshold` | 3.0 | MAD cutoff | Too many drops → increase |
-| `--local_window` | 500 | Local baseline window (bp) | Variable regions → increase |
-| `--min_separation` | 75 | Min bp between drops | Clustered drops → increase |
-| `--annotate_top_n` | 5 | Drops to label on plots | More labels → increase |
-
----
-
-## Optimization (Optional)
-
-### Problem: Too Many Drops?
-
-```bash
-# Find optimal parameters (1 minute)
-python tools/quick_parameter_test.py \
-    --organism ecoli \
-    --gene_id b0455 \
-    --data_dir .
-
-# View recommendations
-cat parameter_sweep_data.json
+```bibtex
+@article{evo2,
+    title   = {Genome modeling and design across all domains of life with Evo 2},
+    author  = {Nguyen, Eric and Poli, Michael and Durrant, Matthew G. and others},
+    journal = {Nature},
+    year    = {2026},
+    doi     = {10.1038/s41586-026-10176-5}
+}
 ```
-
-### Problem: Script is Slow?
-
-```bash
-# Run benchmark (5 minutes)
-sbatch tools/run_benchmark.sh quick
-
-# View results
-cat benchmark_results/benchmark_summary_*.txt
-```
-
-**Expected improvements:**
-- Parameter optimization: 80% fewer false positives
-- Performance tuning: 1.5-2× faster
-
----
-
-## Version Comparison
-
-| Feature | jan22 | jan24 | **jan26_drops** |
-|---------|-------|-------|-----------------|
-| Output organization | ❌ Messy | ✅ Folders | ✅ Folders |
-| Detection methods | 3 | 3 | **7** (3 legacy + 4 new) |
-| Confidence scores | ❌ | ❌ | ✅ |
-| False positive rate | ~30% | ~30% | **~5%** |
-| Tunable parameters | ❌ | ❌ | ✅ |
-
-**Key improvement:** 80% fewer false positives with statistical methods!
-
-See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
-
----
-
-## Troubleshooting
-
-### "Too many drops detected"
-
-```bash
-# Increase thresholds
---zscore_threshold 3.0 --min_separation 100
-```
-
-### "Too few drops detected"
-
-```bash
-# Decrease thresholds
---zscore_threshold 2.0 --local_threshold 1.5
-```
-
-### "CUDA out of memory"
-
-Request exclusive GPU node:
-```bash
-#SBATCH --gres=gpu:1
-#SBATCH --exclusive
-```
-
-### "Script is slow"
-
-1. Verify GPU is being used: `nvidia-smi`
-2. Run benchmark: `sbatch tools/run_benchmark.sh quick`
-3. Check model loading isn't repeated
-
----
-
-## SLURM Template
-
-```bash
-#!/bin/bash
-#SBATCH --job-name=genome_score
-#SBATCH --partition=mit_preemptable
-#SBATCH --gres=gpu:1
-#SBATCH --time=2:00:00
-#SBATCH --mem=50G
-
-module load miniforge/24.3.0-0
-conda activate evo2_sep28
-
-python genome_scoring_jan26_drops.py \
-    --organism ecoli \
-    --gene_id $1 \
-    --detection_methods zscore mad \
-    --zscore_threshold 2.5
-```
-
----
-
-## Algorithm Summary
-
-### How Drop Detection Works
-
-1. **Score sequence** with Evo2 model → per-position entropy
-2. **Smooth** with rolling mean (window=51 bp)
-3. **Compute derivative** (change between positions)
-4. **Find significant drops** using statistical tests:
-   - **Z-score:** Is this drop >2.5 standard deviations below mean?
-   - **MAD:** Is this drop >3 median absolute deviations below median?
-   - **Local:** Is this drop significant relative to local region?
-5. **Cluster nearby drops** (within `min_separation` bp)
-6. **Return strongest** drop in each cluster with confidence score
-
-### What Drops Mean Biologically
-
-- **Splice sites** (exon/intron boundaries)
-- **Conserved domains** (functional regions)
-- **Regulatory elements** (binding sites)
-- **Structural motifs** (RNA secondary structure)
-
----
-
-## Contact
-
-For issues or questions, check this README first, then consult the tools in `tools/` directory.
