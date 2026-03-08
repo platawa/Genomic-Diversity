@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Logs
+*.log
+*.err
+*.out
+logs/
+
+# Large data files
+*.gbff
+*.fna
+*.fasta
+*.npz
+*.npy
+
+# Output directories (large, regenerable)
+results/
+chromosome_scores/
+sae_chromosome_results/
+sae_figure4c_results/
+benchmark_results/
+
+# Evo2 repo (external dependency, not our code)
+evo2/
+
+# Archive of old scripts
+archive/
+
+# Old monolithic script (now in archive/)
+genome_scoring_jan26_drops.py
+
+# OS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# SLURM logs
+slurm-*.out
+
+# SSH/secrets
+*.pem
+*.key
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
