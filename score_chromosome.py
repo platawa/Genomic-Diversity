@@ -74,6 +74,7 @@ import random
 import argparse
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional, Any, Union
 from dataclasses import dataclass, field, asdict
@@ -85,6 +86,27 @@ import torch.multiprocessing as mp
 from Bio import SeqIO
 from Bio.Seq import Seq
 
+
+# =============================================================================
+# VECTORIZED HELPERS (avoid Python-level character loops)
+# =============================================================================
+
+def _find_non_n_runs(sequence: str) -> List[Tuple[int, int]]:
+    """Find contiguous non-N runs using numpy. Returns list of (start, end) tuples.
+
+    ~100x faster than character-by-character Python loop for large sequences.
+    """
+    arr = np.frombuffer(sequence.encode('ascii'), dtype=np.uint8)
+    is_valid = (arr != ord('N'))
+    if not np.any(is_valid):
+        return []
+    # Find boundaries: prepend/append False to detect edges
+    padded = np.concatenate(([False], is_valid, [False]))
+    diffs = np.diff(padded.astype(np.int8))
+    starts = np.where(diffs == 1)[0]
+    ends = np.where(diffs == -1)[0]
+    return list(zip(starts.tolist(), ends.tolist()))
+
 # Import Evo2 model
 from evo2 import Evo2
 
@@ -93,7 +115,6 @@ from detection_methods import (
     detect_drops_zscore, detect_drops_mad,
     detect_rises_zscore, detect_rises_mad,
     _rolling_mean, _cluster_and_pick_best,
-    pair_drops_and_rises as _pair_drops_and_rises_raw,
     METHODS as DETECTION_METHODS,
     RISE_METHODS as DETECTION_RISE_METHODS,
     run_method as run_detection_method,
@@ -412,15 +433,7 @@ def compute_entropy_chunk(
         ll_next = full_logprobs[:, :-1, :].gather(
             -1, input_ids[:, 1:].unsqueeze(-1)
         ).squeeze(-1)  # [1, L]
-        # Remove BOS prediction (position 0 predicts position 1)
-        # After BOS removal from entropy, ll_next aligns as:
-        # ll_next[0] = logprob of predicting token at position 1 given BOS
-        # We want ll_next aligned with entropy positions, so skip BOS→first_token
         ll_next_np = ll_next.squeeze(0).detach().cpu().numpy()
-        # ll_next has len = T-1 (T includes BOS). Entropy has len = T-1.
-        # ll_next[0] = P(tok[1]|BOS), corresponds to entropy[0].
-        # But for "next-token LL at position i", we want P(tok[i+1]|tok[:i+1])
-        # which is ll_next[i] for i in [0..L-2] → len L-1
 
         # True tokens at each position (excluding BOS)
         true_ids = input_ids[0, 1:].cpu().tolist()
@@ -433,17 +446,73 @@ def compute_entropy_chunk(
             "true_token": true_tokens,
         }
 
-    result_fwd = _forward_pass(sequence)
+    def _batched_fwd_rc_pass(seq_fwd, seq_rc):
+        """Batched forward pass: fwd + RC in a single model call (batch=2).
+
+        Both sequences must be the same length (always true for fwd/RC pairs).
+        Returns (result_fwd, result_rc) in the same format as _forward_pass.
+        """
+        bos = _bos_id(tok)
+        toks_fwd = [bos] + tok.tokenize(seq_fwd)
+        toks_rc = [bos] + tok.tokenize(seq_rc)
+        # Stack as [2, T]
+        input_ids = torch.tensor([toks_fwd, toks_rc], dtype=torch.long, device=device)
+        out = model(input_ids)
+        logits = _extract_logits(out).float()  # [2, T, V]
+
+        # ACGT entropy for both
+        logits_sub = logits.index_select(-1, _acgt_ids)  # [2, T, 4]
+        logZ = torch.logsumexp(logits_sub, dim=-1, keepdim=True)
+        logp = logits_sub - logZ
+        H = -(logp.exp() * logp).sum(dim=-1)
+        H = H[:, 1:]  # Remove BOS, [2, L]
+        entropy_both = H.detach().cpu().numpy()  # [2, L]
+
+        if not compute_logprobs:
+            return entropy_both[0], entropy_both[1]
+
+        # P(ACGT) for both
+        p_acgt_both = logp.exp()[:, 1:, :].detach().cpu().numpy()  # [2, L, 4]
+
+        # Next-token log-likelihood from full vocabulary
+        full_logprobs = torch.log_softmax(logits, dim=-1)  # [2, T, V]
+        ll_next = full_logprobs[:, :-1, :].gather(
+            -1, input_ids[:, 1:].unsqueeze(-1)
+        ).squeeze(-1)  # [2, L]
+        ll_next_both = ll_next.detach().cpu().numpy()
+
+        # True tokens (forward strand only)
+        true_ids = input_ids[0, 1:].cpu().tolist()
+        true_tokens = [_id_to_token_str(tok, tid) for tid in true_ids]
+
+        result_fwd = {
+            "entropy": entropy_both[0],
+            "p_acgt": p_acgt_both[0],
+            "ll_next": ll_next_both[0],
+            "true_token": true_tokens,
+        }
+        result_rc = {
+            "entropy": entropy_both[1],
+            "p_acgt": p_acgt_both[1],
+            "ll_next": ll_next_both[1],
+            "true_token": [],  # Not needed for RC
+        }
+        return result_fwd, result_rc
 
     if not reverse_complement:
-        return result_fwd
+        return _forward_pass(sequence)
 
-    # Compute RC and average
+    # Batched fwd + RC in a single model call
     seq_rc = str(Seq(sequence).reverse_complement())
-    result_rc = _forward_pass(seq_rc)
+    try:
+        result_fwd, result_rc = _batched_fwd_rc_pass(sequence, seq_rc)
+    except (torch.cuda.OutOfMemoryError, RuntimeError):
+        # Fall back to sequential if batch=2 OOMs
+        torch.cuda.empty_cache()
+        result_fwd = _forward_pass(sequence)
+        result_rc = _forward_pass(seq_rc)
 
     if not compute_logprobs:
-        # result_fwd and result_rc are np.ndarrays
         return 0.5 * (result_fwd + result_rc[::-1])
 
     # Fused logprobs with RC averaging:
@@ -533,42 +602,49 @@ def score_chromosome_region(
 
     def _write_core(result, run_start_in_chunk, run_end_in_chunk,
                     chunk_start, core_s, core_e):
-        """Write positions from a chunk result to output arrays."""
+        """Write positions from a chunk result to output arrays (vectorized)."""
         ent = _extract_entropy(result)
-        for k in range(run_start_in_chunk, run_end_in_chunk):
-            g = chunk_start + k  # Global position
-            if g < core_s or g >= core_e:
-                continue
-            rk = k - run_start_in_chunk  # Position within run
-            if rk < len(ent):
-                val = ent[rk]
-                if stitch_method == "mean":
-                    if not np.isnan(val):
-                        entropy_sum[g] += val
-                        entropy_count[g] += 1
-                elif stitch_method == "min":
-                    if not np.isnan(val):
-                        entropy[g] = min(entropy[g], val)
-                else:
-                    entropy[g] = val
-            if compute_logprobs and isinstance(result, dict):
-                if rk < len(result["p_acgt"]):
-                    p_acgt[g] = result["p_acgt"][rk]
-                if rk < len(result["ll_next"]):
-                    ll_next[g] = result["ll_next"][rk]
-                if rk < len(result["true_token"]):
-                    true_token[g] = result["true_token"][rk]
+        # Compute the intersection of the run's global range and the core range
+        g_start = chunk_start + run_start_in_chunk
+        g_end = chunk_start + run_end_in_chunk
+        w_start = max(g_start, core_s)
+        w_end = min(g_end, core_e)
+        if w_start >= w_end:
+            return
+        # Offsets into the run result
+        r_start = w_start - g_start
+        r_end = r_start + (w_end - w_start)
+        r_end = min(r_end, len(ent))
+        if r_start >= r_end:
+            return
+        n = r_end - r_start
+        src = ent[r_start:r_end]
+        if stitch_method == "mean":
+            valid = ~np.isnan(src)
+            entropy_sum[w_start:w_start + n][valid] += src[valid]
+            entropy_count[w_start:w_start + n][valid] += 1
+        elif stitch_method == "min":
+            valid = ~np.isnan(src)
+            dest = entropy[w_start:w_start + n]
+            dest[valid] = np.minimum(dest[valid], src[valid])
+        else:
+            entropy[w_start:w_start + n] = src
+        if compute_logprobs and isinstance(result, dict):
+            rp = min(r_end, len(result["p_acgt"]))
+            if rp > r_start:
+                p_acgt[w_start:w_start + (rp - r_start)] = result["p_acgt"][r_start:rp]
+            rl = min(r_end, len(result["ll_next"]))
+            if rl > r_start:
+                ll_next[w_start:w_start + (rl - r_start)] = result["ll_next"][r_start:rl]
+            rt = min(r_end, len(result["true_token"]))
+            if rt > r_start:
+                for ti in range(r_start, rt):
+                    true_token[w_start + ti - r_start] = result["true_token"][ti]
 
     if L <= max_chunk_len:
-        # Process contiguous non-N runs (matching genome_scoring_jan26_drops.py)
-        i = 0
-        while i < L:
-            if sequence[i] == 'N':
-                i += 1
-                continue
-            j = i + 1
-            while j < L and sequence[j] != 'N':
-                j += 1
+        # Process contiguous non-N runs (vectorized N-boundary detection)
+        runs = _find_non_n_runs(sequence)
+        for i, j in runs:
             run_seq = sequence[i:j]
             result = compute_entropy_chunk(run_seq, model, ACGT_IDS, device,
                                            reverse_complement=reverse_complement,
@@ -582,7 +658,6 @@ def score_chromosome_region(
                 for ti, t in enumerate(result["true_token"]):
                     if i + ti < L:
                         true_token[i + ti] = t
-            i = j
 
         if not compute_logprobs:
             return entropy
@@ -621,16 +696,9 @@ def score_chromosome_region(
             logger.info(f"  Chunk {i+1}/{n_chunks}: positions {s:,}-{e:,} "
                         f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
 
-        # Process contiguous non-N runs within this chunk
-        ci = 0
-        while ci < len(chunk_seq):
-            if chunk_seq[ci] == 'N':
-                ci += 1
-                continue
-            cj = ci + 1
-            while cj < len(chunk_seq) and chunk_seq[cj] != 'N':
-                cj += 1
-
+        # Process contiguous non-N runs within this chunk (vectorized)
+        runs = _find_non_n_runs(chunk_seq)
+        for ci, cj in runs:
             run_seq = chunk_seq[ci:cj]
             try:
                 result = compute_entropy_chunk(run_seq, model, ACGT_IDS, device,
@@ -639,11 +707,9 @@ def score_chromosome_region(
             except Exception as ex:
                 if logger:
                     logger.error(f"  Chunk {i+1} run scoring failed: {ex}")
-                ci = cj
                 continue
 
             _write_core(result, ci, cj, s, core_s, core_e)
-            ci = cj
 
     # Post-process experimental stitch methods
     if stitch_method == "mean":
@@ -682,6 +748,7 @@ def _chromosome_gpu_worker(
     ll_next_shm_name: str = None,
     stitch_method: str = "core",
     result_shm_alt_name: str = None,
+    use_torch_compile: bool = False,
 ):
     """
     Worker process that loads a model on a specific GPU and scores assigned chunks.
@@ -713,6 +780,7 @@ def _chromosome_gpu_worker(
     import torch as _torch
     from multiprocessing import shared_memory as _shm
     from evo2 import Evo2
+    from Bio.Seq import Seq as _Seq
 
     # Attach to shared memory
     seq_shm = _shm.SharedMemory(name=seq_shm_name)
@@ -744,6 +812,19 @@ def _chromosome_gpu_worker(
         model.eval()
     elif hasattr(model, "model"):
         model.model.eval()
+
+    # Try torch.compile for fused kernels
+    if use_torch_compile:
+        try:
+            inner = model.model if hasattr(model, "model") else model
+            compiled = _torch.compile(inner, mode="default")
+            if hasattr(model, "model"):
+                model.model = compiled
+            else:
+                model = compiled
+            print(f"[GPU {gpu_id}] torch.compile applied successfully")
+        except Exception as ex:
+            print(f"[GPU {gpu_id}] torch.compile failed ({ex}), continuing without it")
 
     device = "cuda:0"  # Each worker sees only its assigned GPU
     tok = model.tokenizer
@@ -816,6 +897,53 @@ def _chromosome_gpu_worker(
             "true_token": true_toks,
         }
 
+    def _batched_fwd_rc_pass(seq_fwd, seq_rc):
+        """Batched forward pass: fwd + RC in a single model call (batch=2).
+
+        Both sequences are the same length (always true for fwd/RC pairs).
+        Returns (result_fwd, result_rc) in the same format as _forward_pass.
+        """
+        bos = getattr(tok, "bos_id", getattr(tok, "eod_id", None))
+        toks_fwd = [bos] + tok.tokenize(seq_fwd)
+        toks_rc = [bos] + tok.tokenize(seq_rc)
+        input_ids = _torch.tensor([toks_fwd, toks_rc], dtype=_torch.long, device=device)
+        out = model(input_ids)
+        logits = _extract_logits(out).float()  # [2, T, V]
+
+        # ACGT entropy for both
+        logits_sub = logits.index_select(-1, ACGT_IDS.to(logits.device))
+        logZ = _torch.logsumexp(logits_sub, dim=-1, keepdim=True)
+        logp = logits_sub - logZ
+        H = -(logp.exp() * logp).sum(dim=-1)
+        H = H[:, 1:]  # [2, L]
+        entropy_both = H.detach().cpu().numpy()
+
+        if not compute_logprobs:
+            return entropy_both[0], entropy_both[1]
+
+        p_acgt_both = logp.exp()[:, 1:, :].detach().cpu().numpy()
+        full_lp = _torch.log_softmax(logits, dim=-1)
+        ll = full_lp[:, :-1, :].gather(
+            -1, input_ids[:, 1:].unsqueeze(-1)
+        ).squeeze(-1)
+        ll_both = ll.detach().cpu().numpy()
+
+        true_ids = input_ids[0, 1:].cpu().tolist()
+        true_toks = [_id_to_str(tid) for tid in true_ids]
+
+        result_fwd = {
+            "entropy": entropy_both[0], "p_acgt": p_acgt_both[0],
+            "ll_next": ll_both[0], "true_token": true_toks,
+        }
+        result_rc = {
+            "entropy": entropy_both[1], "p_acgt": p_acgt_both[1],
+            "ll_next": ll_both[1], "true_token": [],
+        }
+        return result_fwd, result_rc
+
+    # Track whether batched RC works (OOM falls back to sequential)
+    _batched_rc_ok = True
+
     t0 = _time.time()
     n_scored = 0
     n_skipped = 0
@@ -839,12 +967,25 @@ def _chromosome_gpu_worker(
 
         try:
             with _torch.inference_mode():
-                result_fwd = _forward_pass(chunk_seq)
-
                 if reverse_complement:
-                    from Bio.Seq import Seq as _Seq
                     seq_rc = str(_Seq(chunk_seq).reverse_complement())
-                    result_rc = _forward_pass(seq_rc)
+
+                    # Try batched fwd+RC (batch=2, single model call)
+                    if _batched_rc_ok:
+                        try:
+                            result_fwd, result_rc = _batched_fwd_rc_pass(chunk_seq, seq_rc)
+                        except (_torch.cuda.OutOfMemoryError, RuntimeError) as batch_exc:
+                            if isinstance(batch_exc, _torch.cuda.OutOfMemoryError) or "out of memory" in str(batch_exc).lower():
+                                _torch.cuda.empty_cache()
+                                _batched_rc_ok = False
+                                print(f"[GPU {gpu_id}] Batched fwd+RC OOM, falling back to sequential")
+                                result_fwd = _forward_pass(chunk_seq)
+                                result_rc = _forward_pass(seq_rc)
+                            else:
+                                raise
+                    else:
+                        result_fwd = _forward_pass(chunk_seq)
+                        result_rc = _forward_pass(seq_rc)
 
                     if not compute_logprobs:
                         chunk_entropy = 0.5 * (result_fwd + result_rc[::-1])
@@ -858,6 +999,7 @@ def _chromosome_gpu_worker(
                         chunk_p_acgt = 0.5 * (result_fwd["p_acgt"] + p_rc_complement)
                         chunk_ll = result_fwd["ll_next"]
                 else:
+                    result_fwd = _forward_pass(chunk_seq)
                     if not compute_logprobs:
                         chunk_entropy = result_fwd
                         chunk_p_acgt = None
@@ -939,6 +1081,7 @@ def score_chromosome_region_multigpu(
     compute_logprobs: bool = False,
     logger: logging.Logger = None,
     stitch_method: str = "core",
+    use_torch_compile: bool = False,
 ) -> Union[np.ndarray, dict]:
     """
     Multi-GPU data-parallel version of score_chromosome_region.
@@ -1074,7 +1217,8 @@ def score_chromosome_region_multigpu(
                   p_acgt_shm.name if p_acgt_shm else None,
                   ll_next_shm.name if ll_next_shm else None,
                   stitch_method,
-                  result_shm_alt.name if result_shm_alt else None),
+                  result_shm_alt.name if result_shm_alt else None,
+                  use_torch_compile),
         )
         processes.append(p)
         active_gpu_ids.append(gid)
@@ -1237,6 +1381,9 @@ def run_detection(
 ) -> DetectionResult:
     """Run drop and rise detection.
 
+    Z-score and MAD detection run in parallel using threads (they are
+    CPU-bound numpy code that releases the GIL during array operations).
+
     Args:
         detection_methods: List of method names to run (default: ["zscore", "mad"]).
             Available: zscore, mad, derivative, window_mean_shift, cusum, local_baseline.
@@ -1248,40 +1395,48 @@ def run_detection(
 
     result = DetectionResult()
 
-    # Always run zscore and mad if requested (they have rise detection too)
-    if "zscore" in detection_methods:
-        if logger:
-            logger.info("Running z-score drop detection...")
-        result.drops_zscore = detect_drops_zscore(
-            entropy, smooth_w, zscore_threshold, min_separation
-        )
-        if logger:
-            logger.info(f"  Found {len(result.drops_zscore)} drops")
+    # Run zscore and mad detection in parallel (independent numpy operations)
+    run_zscore = "zscore" in detection_methods
+    run_mad = "mad" in detection_methods
 
-        if logger:
-            logger.info("Running z-score rise detection...")
-        result.rises_zscore = detect_rises_zscore(
-            entropy, smooth_w, zscore_threshold, min_separation
-        )
-        if logger:
-            logger.info(f"  Found {len(result.rises_zscore)} rises")
+    def _detect_zscore():
+        drops = detect_drops_zscore(entropy, smooth_w, zscore_threshold, min_separation)
+        rises = detect_rises_zscore(entropy, smooth_w, zscore_threshold, min_separation)
+        return drops, rises
 
-    if "mad" in detection_methods:
-        if logger:
-            logger.info("Running MAD drop detection...")
-        result.drops_mad = detect_drops_mad(
-            entropy, smooth_w, mad_threshold, min_separation
-        )
-        if logger:
-            logger.info(f"  Found {len(result.drops_mad)} drops")
+    def _detect_mad():
+        drops = detect_drops_mad(entropy, smooth_w, mad_threshold, min_separation)
+        rises = detect_rises_mad(entropy, smooth_w, mad_threshold, min_separation)
+        return drops, rises
 
+    if run_zscore and run_mad:
         if logger:
-            logger.info("Running MAD rise detection...")
-        result.rises_mad = detect_rises_mad(
-            entropy, smooth_w, mad_threshold, min_separation
-        )
+            logger.info("Running z-score and MAD detection in parallel...")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            fut_z = executor.submit(_detect_zscore)
+            fut_m = executor.submit(_detect_mad)
+            result.drops_zscore, result.rises_zscore = fut_z.result()
+            result.drops_mad, result.rises_mad = fut_m.result()
         if logger:
-            logger.info(f"  Found {len(result.rises_mad)} rises")
+            logger.info(f"  Z-score: {len(result.drops_zscore)} drops, "
+                        f"{len(result.rises_zscore)} rises")
+            logger.info(f"  MAD: {len(result.drops_mad)} drops, "
+                        f"{len(result.rises_mad)} rises")
+    else:
+        if run_zscore:
+            if logger:
+                logger.info("Running z-score detection...")
+            result.drops_zscore, result.rises_zscore = _detect_zscore()
+            if logger:
+                logger.info(f"  Z-score: {len(result.drops_zscore)} drops, "
+                            f"{len(result.rises_zscore)} rises")
+        if run_mad:
+            if logger:
+                logger.info("Running MAD detection...")
+            result.drops_mad, result.rises_mad = _detect_mad()
+            if logger:
+                logger.info(f"  MAD: {len(result.drops_mad)} drops, "
+                            f"{len(result.rises_mad)} rises")
 
     # Run any additional methods (drop-only, no rise pairing)
     extra_methods = [m for m in detection_methods if m not in ("zscore", "mad")]
@@ -1299,25 +1454,38 @@ def run_detection(
         # Store in result as extra attribute for downstream access
         setattr(result, f"drops_{method_name}", drops)
 
-    # Pair drops and rises into regions
+    # Pair drops and rises into regions (also parallelized)
     if logger:
         logger.info("Pairing drops and rises into regions...")
 
-    if "zscore" in detection_methods:
-        result.regions_zscore = pair_drops_and_rises(
-            result.drops_zscore, result.rises_zscore,
-            entropy, chrom, genomic_offset, "zscore"
-        )
+    if run_zscore and run_mad:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            fut_zr = executor.submit(pair_drops_and_rises,
+                                     result.drops_zscore, result.rises_zscore,
+                                     entropy, chrom, genomic_offset, "zscore")
+            fut_mr = executor.submit(pair_drops_and_rises,
+                                     result.drops_mad, result.rises_mad,
+                                     entropy, chrom, genomic_offset, "mad")
+            result.regions_zscore = fut_zr.result()
+            result.regions_mad = fut_mr.result()
         if logger:
             logger.info(f"  Z-score: {len(result.regions_zscore)} regions")
-
-    if "mad" in detection_methods:
-        result.regions_mad = pair_drops_and_rises(
-            result.drops_mad, result.rises_mad,
-            entropy, chrom, genomic_offset, "mad"
-        )
-        if logger:
             logger.info(f"  MAD: {len(result.regions_mad)} regions")
+    else:
+        if run_zscore:
+            result.regions_zscore = pair_drops_and_rises(
+                result.drops_zscore, result.rises_zscore,
+                entropy, chrom, genomic_offset, "zscore"
+            )
+            if logger:
+                logger.info(f"  Z-score: {len(result.regions_zscore)} regions")
+        if run_mad:
+            result.regions_mad = pair_drops_and_rises(
+                result.drops_mad, result.rises_mad,
+                entropy, chrom, genomic_offset, "mad"
+            )
+            if logger:
+                logger.info(f"  MAD: {len(result.regions_mad)} regions")
 
     return result
 
@@ -1495,6 +1663,10 @@ def load_chromosome_sequence(
     """
     Load chromosome sequence from FASTA file.
 
+    Uses pysam for O(1) indexed access if a .fai index exists (much faster
+    for large genomes). Falls back to BioPython SeqIO.parse if pysam is
+    unavailable or the index is missing.
+
     Args:
         fasta_path: Path to genome FASTA
         chrom: Chromosome name (RefSeq accession or common name)
@@ -1514,7 +1686,39 @@ def load_chromosome_sequence(
     if logger:
         logger.info(f"Loading chromosome {chrom_id} from {fasta_path}")
 
-    # Load FASTA
+    # Try pysam for indexed O(1) access (requires .fai index)
+    try:
+        import pysam
+        fai_path = fasta_path + ".fai"
+        if os.path.exists(fai_path):
+            if logger:
+                logger.info("  Using pysam indexed FASTA (fast path)")
+            fa = pysam.FastaFile(fasta_path)
+            try:
+                full_length = fa.get_reference_length(chrom_id)
+                actual_start = start if start is not None else 0
+                actual_end = end if end is not None else full_length
+                if actual_start < 0:
+                    actual_start = 0
+                if actual_end > full_length:
+                    actual_end = full_length
+                if actual_start >= actual_end:
+                    raise ValueError(f"Invalid range: start={actual_start}, end={actual_end}")
+                sequence = fa.fetch(chrom_id, actual_start, actual_end).upper()
+                if logger:
+                    logger.info(f"Chromosome length: {full_length:,} bp")
+                    logger.info(f"Extracted region: {actual_start:,}-{actual_end:,} ({len(sequence):,} bp)")
+                return sequence, actual_start, actual_end
+            finally:
+                fa.close()
+        else:
+            if logger:
+                logger.info("  No .fai index found, falling back to BioPython")
+    except ImportError:
+        if logger:
+            logger.info("  pysam not available, using BioPython (slower)")
+
+    # Fallback: BioPython sequential scan
     seq_record = None
     for record in SeqIO.parse(fasta_path, "fasta"):
         if record.id == chrom_id or record.id.startswith(chrom_id):
@@ -1660,6 +1864,12 @@ Examples:
                         help="Save per-position TSV with P(A/C/G/T) and LL_next. "
                              "Warning: ~2-3GB for 50M positions. "
                              "Requires --compute_logprobs.")
+
+    # Performance options
+    parser.add_argument("--torch_compile", action="store_true", default=False,
+                        help="Apply torch.compile to the model for fused kernels. "
+                             "Can give 10-30%% speedup on the forward pass. "
+                             "Falls back gracefully if compilation fails.")
 
     # Other options
     parser.add_argument("--log_level", type=str, default="INFO",
@@ -1818,6 +2028,20 @@ Examples:
         elif hasattr(model, "model"):
             model.model.eval()
         logger.info(f"  Model loaded. Device: {device}")
+
+        # Try torch.compile for fused kernels (10-30% speedup if it works)
+        if args.torch_compile:
+            try:
+                inner = model.model if hasattr(model, "model") else model
+                compiled = torch.compile(inner, mode="default")
+                if hasattr(model, "model"):
+                    model.model = compiled
+                else:
+                    model = compiled
+                logger.info("  torch.compile applied successfully")
+            except Exception as ex:
+                logger.warning(f"  torch.compile failed ({ex}), continuing without it")
+
         ACGT_IDS = get_acgt_token_ids(model, device)
 
         # Auto-probe on single GPU (model is already on 1 GPU)
@@ -1861,6 +2085,7 @@ Examples:
             compute_logprobs=args.compute_logprobs,
             logger=logger,
             stitch_method=args.stitch_method,
+            use_torch_compile=args.torch_compile,
         )
     else:
         scoring_result = score_chromosome_region(

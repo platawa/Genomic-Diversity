@@ -366,7 +366,8 @@ def draw_gene_track(ax, features, view_start, view_end):
         display = _type_short.get(ftype, ftype)
         handles.append(Patch(facecolor=color, edgecolor="none", label=display))
         labels.append(display)
-    ax.legend(handles, labels, loc="upper right", fontsize=7, ncol=2)
+    ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.01, 1.0),
+             fontsize=7, ncol=1, framealpha=0.9)
     ax.set_ylabel("Annotations", fontsize=9)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
@@ -727,14 +728,28 @@ def plot_entropy_profile(entropy, regions, chrom, start, end, prefix,
         ax.plot(positions[::step], sm[::step], linewidth=0.8, color="black",
                 label=f"smoothed (w={w})")
 
-    # Shade detected regions
-    colors = {"zscore": "red", "mad": "blue"}
+    # Shade detected regions — flat alpha, batch rendering via ax.broken_barh
+    colors = {"zscore": "red", "mad": "#2ecc71"}
+    flat_alpha = 0.18
+
+    # Group regions by method for batch rendering
+    region_groups = {}
     for r in regions:
         rg_s = r["genomic_start"] - 1  # to 0-based
         rg_e = r["genomic_end"] - 1
         if rg_e < gs or rg_s > ge:
             continue
-        ax.axvspan(rg_s, rg_e, alpha=0.15, color=colors.get(r["method"], "gray"))
+        method = r["method"]
+        if method not in region_groups:
+            region_groups[method] = []
+        region_groups[method].append((rg_s, rg_e - rg_s))  # (xstart, xwidth)
+
+    y_lo, y_hi = ax.get_ylim() if ax.get_ylim()[1] > ax.get_ylim()[0] else (0, 1.5)
+    for method, bars in region_groups.items():
+        c = colors.get(method, "gray")
+        ax.broken_barh(bars, (y_lo, y_hi - y_lo),
+                       facecolors=c, alpha=flat_alpha, edgecolors="none")
+    ax.set_ylim(y_lo, y_hi)
 
     ax.set_ylabel("Entropy (nats)")
     ax.set_title(f"{chrom}  {gs:,}-{ge:,}")
@@ -789,14 +804,20 @@ def plot_entropy_profile(entropy, regions, chrom, start, end, prefix,
         ax.set_xlabel(f"Genomic position ({chrom})")
         ax.grid(True, alpha=0.2)
 
-    # Legend
-    patches = [mpatches.Patch(color="red", alpha=0.3, label="zscore"),
-               mpatches.Patch(color="blue", alpha=0.3, label="MAD")]
-    axes[0].legend(handles=patches, loc="upper right", fontsize=8)
+    # Legend — placed outside plot to avoid overlapping content
+    from matplotlib.lines import Line2D
+    patches = [
+        mpatches.Patch(color="red", alpha=0.3, label="Z-score region"),
+        mpatches.Patch(color="#2ecc71", alpha=0.3, label="MAD region"),
+        Line2D([], [], linestyle=":", color="red", linewidth=1.2, label="Z-score boundary"),
+        Line2D([], [], linestyle="--", color="#2ecc71", linewidth=1.2, label="MAD boundary"),
+    ]
+    axes[0].legend(handles=patches, loc="upper left",
+                   bbox_to_anchor=(1.01, 1.0), fontsize=7, framealpha=0.9)
 
     plt.tight_layout()
     out_png = _out(prefix, "analysis.png")
-    plt.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.savefig(out_png, dpi=300, bbox_inches="tight")
     plt.close()
     logger.info("Plot saved: %s", out_png)
 
@@ -951,7 +972,7 @@ def plot_transitions(entropy, scored_drops, scored_rises, chrom, start,
 
         plt.tight_layout()
         out_png = _out(prefix, f"transitions_{method}.png")
-        plt.savefig(out_png, dpi=200, bbox_inches="tight")
+        plt.savefig(out_png, dpi=300, bbox_inches="tight")
         plt.close()
         logger.info("Transition plot saved: %s", out_png)
 
@@ -981,9 +1002,14 @@ def _plot_window(ax, sm, all_regions, lo, hi, start, chrom,
     ax.fill_between(xx, sm[lo:hi], alpha=0.15, color='#3498db')
 
     # Find and highlight ALL regions overlapping [lo, hi]
-    colors = {"zscore": "#E74C3C", "mad": "#3498db"}
+    # Flat color per method + text label with actual confidence value
+    colors = {"zscore": "#E74C3C", "mad": "#2ecc71"}
+    linestyles = {"zscore": ":", "mad": "--"}
+    flat_alpha = 0.18
     n_overlapping = 0
     seen_methods = set()
+    y_lo_text, y_hi_text = ax.get_ylim() if ax.get_ylim()[1] > ax.get_ylim()[0] else (0, 1.5)
+    label_y_offset = 0  # alternates 0/1 to stagger labels vertically
     for r in all_regions:
         rs, re = r["drop_start"], r["drop_end"]
         if re < lo or rs > hi:
@@ -1000,40 +1026,69 @@ def _plot_window(ax, sm, all_regions, lo, hi, start, chrom,
         method = r["method"]
         seen_methods.add(method)
         c = colors.get(method, "gray")
-        ax.axvspan(max(rs, lo), min(re, hi), alpha=0.20, color=c)
-        # Boundary lines
+        ls = linestyles.get(method, "-")
+        conf = r.get("start_confidence", 0)
+        ax.axvspan(max(rs, lo), min(re, hi), alpha=flat_alpha, color=c)
+        # Boundary lines with method-specific line styles
         if lo <= rs <= hi:
-            ax.axvline(rs, linestyle='--', linewidth=0.9, alpha=0.7, color=c)
+            ax.axvline(rs, linestyle=ls, linewidth=0.9, alpha=0.7, color=c)
         if lo <= re <= hi:
-            ax.axvline(re, linestyle=':', linewidth=0.9, alpha=0.7, color=c)
+            ax.axvline(re, linestyle=ls, linewidth=0.9, alpha=0.7, color=c)
+        # Confidence value text label at top of region
+        mid_x = (max(rs, lo) + min(re, hi)) / 2
+        # Stagger labels to reduce overlap
+        label_y_frac = 0.95 if label_y_offset % 2 == 0 else 0.85
+        label_y_offset += 1
+        ax.text(mid_x, label_y_frac, f"{conf:.1f}",
+                transform=ax.get_xaxis_transform(),
+                ha='center', va='top', fontsize=5.5, fontweight='bold',
+                color=c, alpha=0.9,
+                bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                          edgecolor=c, alpha=0.7, linewidth=0.5))
 
     # Draw the highlight (trigger) region on top with distinct style
     if highlight_region is not None:
         hrs = highlight_region["drop_start"]
         hre = highlight_region["drop_end"]
-        # Gold/yellow filled span — stands out from red/blue
-        ax.axvspan(max(hrs, lo), min(hre, hi), alpha=0.35,
+        h_conf = highlight_region.get("start_confidence", 0)
+        ax.axvspan(max(hrs, lo), min(hre, hi), alpha=0.30,
                    color='#FFD700', edgecolor='#B8860B', linewidth=2.5,
                    label="Selected region")
-        # Thick boundary lines
         if lo <= hrs <= hi:
             ax.axvline(hrs, linestyle='--', linewidth=2.0, alpha=0.9,
                        color='#B8860B')
         if lo <= hre <= hi:
             ax.axvline(hre, linestyle=':', linewidth=2.0, alpha=0.9,
                        color='#B8860B')
+        # Confidence label for highlight region
+        h_mid = (max(hrs, lo) + min(hre, hi)) / 2
+        ax.text(h_mid, 0.95, f"{h_conf:.1f}",
+                transform=ax.get_xaxis_transform(),
+                ha='center', va='top', fontsize=6.5, fontweight='bold',
+                color='#B8860B',
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='#FFD700',
+                          edgecolor='#B8860B', alpha=0.85, linewidth=1.0))
 
-    # Legend patches for methods
+    # Legend — simplified, no opacity tiers
+    from matplotlib.lines import Line2D
     patches = []
     if highlight_region is not None:
         patches.append(mpatches.Patch(
             color='#FFD700', alpha=0.5, edgecolor='#B8860B', linewidth=1.5,
             label="Selected region"))
     for m in sorted(seen_methods):
-        patches.append(mpatches.Patch(
-            color=colors.get(m, "gray"), alpha=0.3, label=f"{m}"))
+        c = colors.get(m, "gray")
+        ls = linestyles.get(m, "-")
+        label = "Z-score" if m == "zscore" else "MAD"
+        patches.append(mpatches.Patch(color=c, alpha=0.3, label=f"{label} region"))
+        patches.append(Line2D([], [], linestyle=ls, color=c, linewidth=1.2,
+                               label=f"{label} boundary"))
+    patches.append(Line2D([], [], marker='', linestyle='', label=''))
+    patches.append(Line2D([], [], marker='', linestyle='',
+                          label='Numbers = confidence score'))
     if patches:
-        ax.legend(handles=patches, loc="upper right", fontsize=8)
+        ax.legend(handles=patches, loc="upper left",
+                  bbox_to_anchor=(1.01, 1.0), fontsize=7, framealpha=0.9)
 
     glo = start + lo + 1
     ghi = start + hi
@@ -1105,7 +1160,7 @@ def plot_zoom_regions(entropy, regions, chrom, start, prefix,
             zoom_dir,
             f"zoom_{idx+1:03d}_{r['method']}_{r['drop_start']}.png"
         )
-        plt.savefig(out_png, dpi=150, bbox_inches="tight")
+        plt.savefig(out_png, dpi=300, bbox_inches="tight")
         plt.close()
 
     logger.info("Zoom plots saved: %s/ (%d plots)", zoom_dir, len(plot_regions))
@@ -1172,7 +1227,7 @@ def plot_random_regions(entropy, regions, chrom, start, prefix,
             rand_dir,
             f"random_{idx+1:03d}_pos{center}.png"
         )
-        plt.savefig(out_png, dpi=150, bbox_inches="tight")
+        plt.savefig(out_png, dpi=300, bbox_inches="tight")
         plt.close()
 
     logger.info("Random region plots saved: %s/ (%d plots)", rand_dir, len(candidates))
@@ -1221,7 +1276,7 @@ def plot_interactive_html(entropy, regions, chrom, start, prefix, smooth_w=51,
     for r in regions:
         gstart = r["genomic_start"] - 1
         gend = r["genomic_end"] - 1
-        color = 'rgba(255,0,0,0.1)' if r["method"] == "zscore" else 'rgba(0,0,255,0.1)'
+        color = 'rgba(255,0,0,0.1)' if r["method"] == "zscore" else 'rgba(46,204,113,0.1)'
         fig.add_vrect(
             x0=gstart, x1=gend,
             fillcolor=color, line_width=0,
@@ -1521,9 +1576,10 @@ Examples:
       --gtf /path/to/genomic.gtf --all_plots
         """,
     )
-    ap.add_argument("--prefix", required=True,
+    ap.add_argument("--prefix", default=None,
                     help="Output prefix used for scoring "
-                         "(e.g. chromosome_scores/chr22_4gpu)")
+                         "(e.g. chromosome_scores/chr22_4gpu). "
+                         "Not required when using --auto.")
     ap.add_argument("--plot", action="store_true",
                     help="Generate entropy profile plot (needs matplotlib)")
     ap.add_argument("--plot_start", type=int, default=None,
@@ -1583,6 +1639,10 @@ Examples:
     import time as _time
     _viz_wall_start = _time.time()
     setup_logging()
+
+    # Validate: need either --prefix or --auto
+    if not args.auto and not args.prefix:
+        ap.error("--prefix is required (or use --auto --chrom <name>)")
 
     # Auto-discover scoring run
     _viz_run_dir = None

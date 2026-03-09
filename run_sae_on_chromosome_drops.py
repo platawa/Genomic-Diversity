@@ -42,7 +42,7 @@ OUTPUTS
         signature_features.tsv      - Features recurring across regions
         feature_matrices.npz        - Raw SAE feature matrices (for notebook)
     plots/
-        region_<N>_features.png     - Per-feature line plots with annotations
+        region_<N>_features.png     - Figure 4g style feature plots (filled area + gene track)
         region_<N>_entropy.png      - Entropy + drop boundary markers
         signature_summary.png       - Cross-region signature bar chart
     sae_exploration.ipynb           - Interactive Jupyter notebook
@@ -183,6 +183,17 @@ DEFAULT_PADDING = 500
 DEFAULT_TOP_FEATURES_PER_REGION = 10
 DEFAULT_N_PLOT_FEATURES = 10
 DEFAULT_SIGNATURE_MIN_PREVALENCE = 0.3
+
+# Known biological SAE features from Evo2 paper (Figure 4g).
+# These are always plotted to track interpretable biology across regions.
+# Maps feature_id -> (short_label, description)
+KNOWN_BIO_FEATURES = {
+    15680: ("CDS",        "coding regions"),
+    28339: ("Intron",     "introns"),
+    1050:  ("Exon start", "first base of exon following intron"),
+    25666: ("Exon end",   "last base of exon followed by intron"),
+    24278: ("Frameshift", "mutation-sensitive, frameshifts & premature stops"),
+}
 
 
 # =============================================================================
@@ -880,6 +891,229 @@ def plot_region_entropy(
     plt.close(fig)
 
 
+def plot_region_figure4g(
+    result: Dict[str, Any],
+    region_idx: int,
+    output_path: str,
+    annotations: Optional[List[List]] = None,
+    entropy: Optional[np.ndarray] = None,
+    gtf_features: Optional[List] = None,
+    n_plot_features: int = DEFAULT_N_PLOT_FEATURES,
+    chrom: str = "",
+):
+    """
+    Figure 4g-style plot: filled area SAE feature traces + annotation track.
+
+    Matches the Evo2 paper Figure 4g visual style:
+      - Blue filled area plots (fill_between) for each feature
+      - Orange labels for known bio features, gray for region-specific
+      - Gray exon/CDS shading behind traces (like Fig 4g)
+      - Scoring-style annotation track at bottom (colored rows per feature type)
+      - Optional entropy panel
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+
+    region = result['region']
+    feature_ts = result['feature_ts']
+
+    # Build feature list: known biological features first, then top region features
+    bio_feature_ids = list(KNOWN_BIO_FEATURES.keys())
+    region_top = [f for f in result['top_feature_idx'][:n_plot_features]
+                  if f not in KNOWN_BIO_FEATURES]
+    selected_features = bio_feature_ids + region_top
+
+    if len(selected_features) == 0:
+        return
+
+    n_bio = len(bio_feature_ids)
+    n_features = len(selected_features)
+    has_entropy = entropy is not None
+    has_gene_track = gtf_features is not None and len(gtf_features) > 0
+
+    # Panel layout: features + optional entropy + annotation track
+    n_panels = n_features + (1 if has_entropy else 0) + (1 if has_gene_track else 0)
+    height_ratios = [1.0] * n_features
+    if has_entropy:
+        height_ratios.append(1.0)
+    if has_gene_track:
+        height_ratios.append(1.2)  # taller annotation track (multiple rows)
+
+    fig, axes = plt.subplots(
+        n_panels, 1,
+        figsize=(30, 1.0 * n_panels + 0.5),
+        sharex=True,
+        gridspec_kw={'height_ratios': height_ratios, 'hspace': 0.05},
+    )
+    if n_panels == 1:
+        axes = [axes]
+
+    # Genomic coordinates
+    padded_start = region.get('padded_start', 0)
+    padded_end = region.get('padded_end', feature_ts.shape[0])
+    seq_len = feature_ts.shape[0]
+    x = np.linspace(padded_start, padded_end, seq_len, endpoint=False)
+    drop_x = padded_start + region['drop_local_pos']
+    rise_x = padded_start + region['rise_local_pos']
+
+    # Color palette (matching Fig 4g)
+    fill_color = '#4A90D9'       # Blue (matching paper)
+    fill_alpha = 0.85
+    line_color = '#3A7BC8'
+    line_width = 0.3
+    bio_label_color = '#E67E22'  # Orange for known bio feature labels
+    region_label_color = '#555555'  # Gray for region-specific feature labels
+
+    # Collect exon/CDS regions for gray shading on feature panels (Fig 4g style)
+    exon_regions = []
+    if gtf_features:
+        for feat in gtf_features:
+            if feat["feature_type"] in ("exon", "CDS"):
+                s = max(feat["start"], padded_start)
+                e = min(feat["end_exclusive"], padded_end)
+                if s < e:
+                    exon_regions.append((s, e))
+
+    # ── Feature panels (filled area style) ──
+    for ind, feature_id in enumerate(selected_features):
+        ax = axes[ind]
+        trace = feature_ts[:, feature_id]
+
+        # Gray exon/CDS shading behind traces (like Fig 4g)
+        for s, e in exon_regions:
+            ax.axvspan(s, e, alpha=0.12, facecolor='#888888', edgecolor='none', zorder=0)
+
+        # Filled area plot (Figure 4g style)
+        ax.fill_between(x, 0, trace, facecolor=fill_color, alpha=fill_alpha,
+                         edgecolor=line_color, linewidth=line_width)
+
+        # Drop/rise boundary markers
+        ax.axvline(drop_x, color='#D62828', linestyle='--', lw=0.7, alpha=0.5)
+        ax.axvline(rise_x, color='#1D3557', linestyle='--', lw=0.7, alpha=0.5)
+
+        ymax = max(np.percentile(trace[trace > 0], 99) if np.any(trace > 0) else 3, 3)
+        ax.set_xlim(padded_start, padded_end)
+        ax.set_ylim([0, ymax])
+        ax.set_yticks([0, int(ymax)])
+
+        # Label: orange for known bio features, gray for region-specific
+        is_bio = feature_id in KNOWN_BIO_FEATURES
+        if is_bio:
+            bio_name = KNOWN_BIO_FEATURES[feature_id][0]
+            label = f"{bio_name}\nf/{feature_id}"
+            label_color = bio_label_color
+        else:
+            label = f"f/{feature_id}"
+            label_color = region_label_color
+        ax.set_ylabel(label, fontsize=8, rotation=0,
+                       labelpad=50, va='center', fontweight='bold',
+                       color=label_color)
+
+        # "Feature activations" label on the right of middle panel
+        if ind == n_features // 2:
+            ax2 = ax.twinx()
+            ax2.set_ylabel("Feature activations", fontsize=10, rotation=270,
+                           labelpad=15, color='#555555')
+            ax2.set_yticks([])
+
+        ax.tick_params(axis='y', labelsize=6)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.tick_params(axis='x', labelbottom=False)
+
+    # ── Entropy panel ──
+    if has_entropy:
+        ax = axes[n_features]
+        ent_slice = entropy[padded_start:padded_end]
+        ent_x = np.linspace(padded_start, padded_end, len(ent_slice), endpoint=False)
+
+        # Gray exon shading on entropy too
+        for s, e in exon_regions:
+            ax.axvspan(s, e, alpha=0.12, facecolor='#888888', edgecolor='none', zorder=0)
+
+        ax.fill_between(ent_x, 0, ent_slice, facecolor='#2c3e50', alpha=0.5,
+                         edgecolor='#2c3e50', linewidth=0.3)
+        ax.axvspan(drop_x, rise_x, alpha=0.15, color='#e74c3c')
+        ax.axvline(drop_x, color='#D62828', linestyle='--', lw=0.7, alpha=0.5)
+        ax.axvline(rise_x, color='#1D3557', linestyle='--', lw=0.7, alpha=0.5)
+        ax.set_ylabel("Entropy", fontsize=8, rotation=0, labelpad=50,
+                       va='center', fontweight='bold', color='#555555')
+        ax.tick_params(axis='y', labelsize=6)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.tick_params(axis='x', labelbottom=False)
+
+    # ── Annotation track (scoring style: colored rows per feature type) ──
+    if has_gene_track:
+        gene_ax = axes[-1]
+        # Use the same draw_gene_track from analyze_scoring_results
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools'))
+            from analyze_scoring_results import draw_gene_track
+            draw_gene_track(gene_ax, gtf_features, padded_start, padded_end)
+        except ImportError:
+            # Fallback: simple bars
+            from matplotlib.patches import Rectangle, Patch
+            _gff_colors = {
+                "CDS": "#3498db", "gene": "#2ecc71", "exon": "#a8e6cf",
+                "transcript": "#1abc9c", "five_prime_UTR": "#e67e22",
+                "three_prime_UTR": "#e74c3c",
+            }
+            vis = [f for f in gtf_features
+                   if f["start"] < padded_end and f["end_exclusive"] > padded_start]
+            types_present = sorted(set(f["feature_type"] for f in vis))
+            n_types = max(len(types_present), 1)
+            sub_h = 1.0 / n_types
+            type_to_row = {ft: i for i, ft in enumerate(types_present)}
+            gene_ax.set_ylim(0, 1)
+            gene_ax.set_yticks([])
+            for feat in vis:
+                row = type_to_row[feat["feature_type"]]
+                color = _gff_colors.get(feat["feature_type"], "#95a5a6")
+                s = max(feat["start"], padded_start)
+                e = min(feat["end_exclusive"], padded_end)
+                gene_ax.add_patch(Rectangle(
+                    (s, row * sub_h + sub_h * 0.075), e - s, sub_h * 0.85,
+                    facecolor=color, edgecolor="none", alpha=0.85))
+            for ftype, row in type_to_row.items():
+                color = _gff_colors.get(ftype, "#95a5a6")
+                gene_ax.text(padded_start, (row + 0.5) * sub_h, ftype,
+                             ha="left", va="center", fontsize=6,
+                             fontweight="bold", color=color)
+
+        gene_ax.set_xlim(padded_start, padded_end)
+        gene_ax.set_ylabel("Annotations", fontsize=8, rotation=0, labelpad=50,
+                           va='center', color='#555555')
+        gene_ax.tick_params(axis='x', labelbottom=True, labelsize=8)
+        chrom_label = chrom if chrom else "chr"
+        gene_ax.set_xlabel(f"Position (bp)", fontsize=10)
+    else:
+        axes[-1].tick_params(axis='x', labelbottom=True, labelsize=8)
+        axes[-1].set_xlabel("Position (bp)", fontsize=10)
+
+    # X-axis formatting
+    for ax in axes:
+        ax.set_xlim(padded_start, padded_end)
+
+    def _fmt_pos(v, _):
+        return f"{int(v):,}"
+    axes[-1].xaxis.set_major_formatter(FuncFormatter(_fmt_pos))
+
+    # Title — inside the figure, tight to top
+    axes[0].set_title(
+        f"Region {region_idx+1}: "
+        f"{region['genomic_start']:,}-{region['genomic_end']:,} | "
+        f"method={region['method']} | confidence={region['start_confidence']:.2f}",
+        fontsize=11, fontweight='bold', pad=4,
+    )
+
+    plt.savefig(output_path, dpi=200, bbox_inches='tight',
+                facecolor='white', pad_inches=0.1)
+    plt.close(fig)
+
+
 def plot_signature_summary(
     signatures: List[Dict[str, Any]],
     output_path: str,
@@ -1468,7 +1702,12 @@ Examples:
     parser.add_argument("--min_confidence", type=float, default=DEFAULT_MIN_CONFIDENCE,
                         help=f"Minimum start_confidence to analyze (default: {DEFAULT_MIN_CONFIDENCE})")
     parser.add_argument("--max_regions", type=int, default=DEFAULT_MAX_REGIONS,
-                        help=f"Maximum regions to analyze (default: {DEFAULT_MAX_REGIONS})")
+                        help=f"Maximum regions to analyze with SAE (default: {DEFAULT_MAX_REGIONS}). "
+                             "All of these are used for latent analysis.")
+    parser.add_argument("--max_plot_regions", type=int, default=50,
+                        help="Maximum regions to generate per-region plots for (default: 50). "
+                             "Set lower than --max_regions to run SAE on many regions for "
+                             "latent analysis but only plot the top N.")
 
     # SAE parameters
     parser.add_argument("--padding", type=int, default=DEFAULT_PADDING,
@@ -1737,8 +1976,10 @@ Examples:
     logger.info("-" * 70)
 
     plots_dir = os.path.join(args.output_dir, 'plots')
+    n_plot = min(len(results), args.max_plot_regions)
+    logger.info(f"Generating per-region plots for top {n_plot} of {len(results)} regions")
 
-    for i, result in enumerate(results):
+    for i, result in enumerate(results[:n_plot]):
         region = result['region']
 
         # Get annotations for this region (GenBank or GTF)
@@ -1763,12 +2004,13 @@ Examples:
                           if f['end_exclusive'] > region['padded_start']
                           and f['start'] < region['padded_end']]
 
-        # Feature line plots (Figure 4C style with gene track + entropy)
+        # Feature plots (Figure 4g style: filled area + annotations + gene track)
         features_path = os.path.join(plots_dir, f'region_{i+1}_features.png')
-        plot_region_features(
+        plot_region_figure4g(
             result, i, features_path, annotations,
             entropy=entropy, gtf_features=region_gtf,
             n_plot_features=args.n_plot_features,
+            chrom=args.chrom,
         )
 
         # Standalone entropy curve (kept for quick viewing)
@@ -1776,9 +2018,9 @@ Examples:
         plot_region_entropy(result, entropy, i, entropy_path)
 
         if (i + 1) % 10 == 0:
-            logger.info(f"  Generated plots for {i+1}/{len(results)} regions")
+            logger.info(f"  Generated plots for {i+1}/{n_plot} regions")
 
-    logger.info(f"Generated {len(results) * 2} plots")
+    logger.info(f"Generated {n_plot * 2} per-region plots ({len(results)} total regions for analysis)")
 
     # Signature summary
     summary_path = os.path.join(plots_dir, 'signature_summary.png')
@@ -1905,7 +2147,7 @@ Examples:
     logger.info(f"  data/sae_results.tsv              - Per-region top features")
     logger.info(f"  data/signature_features.tsv        - Recurring features (with method breakdown)")
     logger.info(f"  data/feature_matrices.npz          - Raw feature matrices")
-    logger.info(f"  plots/region_*_features.png        - Feature line plots (notebook style)")
+    logger.info(f"  plots/region_*_features.png        - Figure 4g style (filled area + gene track)")
     logger.info(f"  plots/region_*_entropy.png         - Entropy curves with boundaries")
     logger.info(f"  plots/signature_summary.png        - Signature feature bar chart")
     logger.info(f"  plots/feature_heatmap.png          - Feature x region activation heatmap")
