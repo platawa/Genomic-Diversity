@@ -681,6 +681,47 @@ def plot_embedding(
         logger.info(f"Saved {embedding_name} embedding plot: {output_path}")
 
 
+def _plot_annotation_embedding(
+    coordinates: np.ndarray,
+    annotations: List[str],
+    output_path: str,
+    embedding_name: str = "t-SNE",
+    n_regions: int = 0,
+    logger: logging.Logger = None,
+):
+    """Single-panel scatter of embedding colored by genomic annotation."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    annotation_colors = {
+        "CDS": "#e41a1c",
+        "UTR/exon": "#ff7f00",
+        "Intron": "#377eb8",
+        "Intergenic": "#999999",
+    }
+    annotation_order = ["CDS", "UTR/exon", "Intron", "Intergenic"]
+
+    x, y = coordinates[:, 0], coordinates[:, 1]
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for label in annotation_order:
+        mask = np.array([a == label for a in annotations])
+        if mask.any():
+            ax.scatter(x[mask], y[mask], c=annotation_colors.get(label, '#999999'),
+                       label=f"{label} ({mask.sum()})",
+                       s=30, alpha=0.7, edgecolors='none')
+    ax.legend(fontsize=11, markerscale=2)
+    ax.set_title(f"{embedding_name} of SAE Region Fingerprints (N={n_regions})\n"
+                 f"Colored by Genomic Annotation", fontsize=13)
+    ax.set_xlabel(f"{embedding_name} 1")
+    ax.set_ylabel(f"{embedding_name} 2")
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    if logger:
+        logger.info(f"Saved annotation-colored {embedding_name}: {output_path}")
+
+
 def plot_cluster_composition(
     cluster_assignments: np.ndarray,
     region_metadata: List[Dict[str, Any]],
@@ -1247,6 +1288,9 @@ Examples:
     parser.add_argument("--global_stats", type=str, default=None,
                         help="Path to global_feature_stats.npz for genome-wide normalization "
                              "of max-pooled vectors before similarity/clustering")
+    parser.add_argument("--annotation_tsv", type=str, default=None,
+                        help="Path to TSV with 'annotation' column (from plot_tsne_by_annotation.py). "
+                             "Generates an extra annotation-colored t-SNE/UMAP plot.")
     parser.add_argument("--log_level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
@@ -1408,6 +1452,26 @@ Examples:
                 embedding_name="t-SNE",
                 logger=logger,
             )
+
+        # --- Annotation-colored embedding (if --annotation_tsv provided) ---
+        if args.annotation_tsv:
+            import pandas as pd
+            ann_df = pd.read_csv(args.annotation_tsv, sep='\t', comment='#')
+            if 'annotation' in ann_df.columns and len(ann_df) == n_regions:
+                annotations = ann_df['annotation'].tolist()
+                for emb_key, emb_name in [('embedding_tsne', 't-SNE'),
+                                           ('embedding_umap', 'UMAP')]:
+                    coords = embedding_results.get(emb_key)
+                    if coords is None:
+                        continue
+                    _plot_annotation_embedding(
+                        coords, annotations,
+                        os.path.join(plots_dir, f'{emb_name.lower().replace("-", "")}_by_annotation.png'),
+                        embedding_name=emb_name, n_regions=n_regions, logger=logger,
+                    )
+            else:
+                logger.warning(f"--annotation_tsv: expected {n_regions} rows with 'annotation' column, "
+                               f"got {len(ann_df)} rows, columns={list(ann_df.columns)}")
 
         # --- Cluster composition ---
         if embedding_results['n_clusters'] > 1:
