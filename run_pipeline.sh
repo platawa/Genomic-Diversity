@@ -222,6 +222,7 @@ python run_sae_on_chromosome_drops.py \
     --output_dir ${RESULTS_DIR} \
     --max_regions ${SAE_MAX_REGIONS} \
     --min_confidence ${SAE_MIN_CONFIDENCE} \
+    --stratified \
     --run_latent_analysis
 SBATCH
 )
@@ -238,9 +239,53 @@ if [[ "$CHROM" == "all" ]]; then
     echo "Submitting pipeline for ALL chromosomes"
     echo "Order: $ALL_CHROMS"
     echo ""
+
+    SAE_JOB_IDS=()
     for c in $ALL_CHROMS; do
-        run_chromosome "$c"
+        output=$(run_chromosome "$c")
+        echo "$output" | grep -v "^SAE_JOB_ID="
+        sae_id=$(echo "$output" | grep "^SAE_JOB_ID=" | cut -d= -f2)
+        if [[ -n "$sae_id" && "$sae_id" != "PREVIEW_JOB_ID" ]]; then
+            SAE_JOB_IDS+=("$sae_id")
+        fi
     done
+
+    # ── Stage 4: Genome-wide SAE aggregation (CPU, depends on all SAE jobs) ──
+    if [[ ${#SAE_JOB_IDS[@]} -gt 0 ]] || $DRY_RUN; then
+        echo "========================================"
+        echo "Stage 4: Genome-wide SAE aggregation"
+        echo "========================================"
+
+        # Build dependency string: afterok:id1:id2:...
+        dep_str=""
+        if [[ ${#SAE_JOB_IDS[@]} -gt 0 ]]; then
+            dep_str=$(IFS=:; echo "${SAE_JOB_IDS[*]}")
+        fi
+
+        aggregate_script=$(cat <<SBATCH
+#!/bin/bash
+#SBATCH -J aggregate_genome_sae
+#SBATCH -p ${CPU_PARTITION}
+#SBATCH --cpus-per-task=${AGGREGATE_CPUS}
+#SBATCH --mem=${AGGREGATE_MEM}
+#SBATCH -t ${AGGREGATE_TIME}
+#SBATCH -o ${PROJECT_DIR}/logs/aggregate_genome_sae_%j.out
+#SBATCH -e ${PROJECT_DIR}/logs/aggregate_genome_sae_%j.err
+
+cd ${PROJECT_DIR}
+module load miniforge/24.3.0-0
+conda activate ${CONDA_ENV}
+
+python tools/aggregate_genome_sae_stats.py \
+    --results_dir ${RESULTS_DIR} \
+    --all_human
+SBATCH
+)
+
+        submit_job "aggregate_genome_sae" "$aggregate_script" "$dep_str"
+    fi
+
+    echo ""
     echo "All jobs submitted. Monitor with: squeue -u \$USER"
 else
     run_chromosome "$CHROM"

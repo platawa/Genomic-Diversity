@@ -434,6 +434,80 @@ def find_overlapping_regions(
     return merged
 
 
+def stratified_sample_regions(
+    regions: List[Dict[str, Any]],
+    max_regions: int,
+    n_bins: int = 10,
+    logger: logging.Logger = None,
+) -> List[Dict[str, Any]]:
+    """Sample regions across the full confidence range using stratified bins.
+
+    Instead of taking the top-N by confidence (which produces homogeneous
+    clusters in t-SNE), this divides the confidence range into equal bins
+    and samples proportionally from each bin.
+
+    Args:
+        regions: All regions, sorted by confidence (highest first).
+        max_regions: Total number of regions to select.
+        n_bins: Number of equal-width bins across the confidence range.
+        logger: Optional logger.
+
+    Returns:
+        Stratified sample of regions, sorted by confidence (highest first).
+    """
+    if len(regions) <= max_regions:
+        if logger:
+            logger.info(f"Stratified sampling: only {len(regions)} regions, keeping all")
+        return regions
+
+    confidences = np.array([r['start_confidence'] for r in regions])
+    conf_min, conf_max = confidences.min(), confidences.max()
+
+    if conf_min == conf_max:
+        if logger:
+            logger.info("Stratified sampling: all regions have same confidence, using top-N")
+        return regions[:max_regions]
+
+    bin_edges = np.linspace(conf_min, conf_max, n_bins + 1)
+    per_bin = max(1, max_regions // n_bins)
+    sampled = []
+
+    rng = np.random.RandomState(42)
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        if i < n_bins - 1:
+            mask = (confidences >= lo) & (confidences < hi)
+        else:
+            mask = (confidences >= lo) & (confidences <= hi)
+        bin_indices = np.where(mask)[0]
+        if len(bin_indices) == 0:
+            continue
+        n_take = min(per_bin, len(bin_indices))
+        chosen = rng.choice(bin_indices, size=n_take, replace=False)
+        sampled.extend(chosen)
+
+    # If we have fewer than max_regions, fill from remaining
+    sampled_set = set(sampled)
+    if len(sampled) < max_regions:
+        remaining = [i for i in range(len(regions)) if i not in sampled_set]
+        rng.shuffle(remaining)
+        sampled.extend(remaining[:max_regions - len(sampled)])
+
+    # Truncate if we overshot
+    sampled = sampled[:max_regions]
+
+    result = [regions[i] for i in sorted(sampled)]
+    # Re-sort by confidence (highest first) for consistent downstream behavior
+    result.sort(key=lambda r: -r['start_confidence'])
+
+    if logger:
+        result_confs = [r['start_confidence'] for r in result]
+        logger.info(f"Stratified sampling: {len(result)} regions from {n_bins} bins "
+                     f"(conf range: {min(result_confs):.2f} - {max(result_confs):.2f})")
+
+    return result
+
+
 def filter_regions_by_method(
     regions: List[Dict[str, Any]],
     method_filter: str,
@@ -1740,6 +1814,13 @@ Examples:
                              "Leiden clustering, t-SNE/UMAP) after SAE extraction")
     parser.add_argument("--leiden_resolution", type=float, default=1.0,
                         help="Leiden resolution for latent analysis (default: 1.0)")
+    parser.add_argument("--stratified", action="store_true",
+                        help="Use stratified sampling across confidence bins instead of "
+                             "top-N selection. Produces more diverse region sets for t-SNE.")
+    parser.add_argument("--latent_only", action="store_true",
+                        help="Skip per-region plot generation (STEP 9) but still run SAE "
+                             "extraction, save results, summary plots, and latent analysis. "
+                             "Useful with --max_regions 3000 --stratified --run_latent_analysis.")
 
     args = parser.parse_args()
 
@@ -1774,6 +1855,8 @@ Examples:
     desc_parts = []
     if args.overlap_only or args.method_filter == 'both':
         desc_parts.append("overlap")
+    if args.stratified:
+        desc_parts.append("stratified")
     desc_parts.append(f"max{args.max_regions}")
     desc_parts.append(f"conf{args.min_confidence}")
     descriptor = "_".join(desc_parts)
@@ -1831,8 +1914,13 @@ Examples:
 
     # Now apply max_regions cap
     if args.max_regions > 0 and len(regions) > args.max_regions:
-        logger.info(f"Capping to top {args.max_regions} regions (from {len(regions)})")
-        regions = regions[:args.max_regions]
+        if args.stratified:
+            regions = stratified_sample_regions(
+                regions, args.max_regions, n_bins=10, logger=logger,
+            )
+        else:
+            logger.info(f"Capping to top {args.max_regions} regions (from {len(regions)})")
+            regions = regions[:args.max_regions]
 
     logger.info(f"Using {len(regions)} regions")
     for i, r in enumerate(regions[:5]):
@@ -1976,51 +2064,55 @@ Examples:
     logger.info("-" * 70)
 
     plots_dir = os.path.join(args.output_dir, 'plots')
-    n_plot = min(len(results), args.max_plot_regions)
-    logger.info(f"Generating per-region plots for top {n_plot} of {len(results)} regions")
 
-    for i, result in enumerate(results[:n_plot]):
-        region = result['region']
+    if args.latent_only:
+        logger.info("--latent_only: skipping per-region plots")
+    else:
+        n_plot = min(len(results), args.max_plot_regions)
+        logger.info(f"Generating per-region plots for top {n_plot} of {len(results)} regions")
 
-        # Get annotations for this region (GenBank or GTF)
-        annotations = []
-        if gb_records:
-            annotations = find_relevant_gb_annotations(
-                gb_records,
-                region['padded_start'],
-                region['padded_end'] - region['padded_start'],
+        for i, result in enumerate(results[:n_plot]):
+            region = result['region']
+
+            # Get annotations for this region (GenBank or GTF)
+            annotations = []
+            if gb_records:
+                annotations = find_relevant_gb_annotations(
+                    gb_records,
+                    region['padded_start'],
+                    region['padded_end'] - region['padded_start'],
+                )
+            elif gtf_features_all:
+                annotations = gtf_to_genbank_annotations(
+                    gtf_features_all,
+                    region['padded_start'],
+                    region['padded_end'] - region['padded_start'],
+                )
+
+            # Per-region GTF features for gene track panel
+            region_gtf = None
+            if gtf_features_all:
+                region_gtf = [f for f in gtf_features_all
+                              if f['end_exclusive'] > region['padded_start']
+                              and f['start'] < region['padded_end']]
+
+            # Feature plots (Figure 4g style: filled area + annotations + gene track)
+            features_path = os.path.join(plots_dir, f'region_{i+1}_features.png')
+            plot_region_figure4g(
+                result, i, features_path, annotations,
+                entropy=entropy, gtf_features=region_gtf,
+                n_plot_features=args.n_plot_features,
+                chrom=args.chrom,
             )
-        elif gtf_features_all:
-            annotations = gtf_to_genbank_annotations(
-                gtf_features_all,
-                region['padded_start'],
-                region['padded_end'] - region['padded_start'],
-            )
 
-        # Per-region GTF features for gene track panel
-        region_gtf = None
-        if gtf_features_all:
-            region_gtf = [f for f in gtf_features_all
-                          if f['end_exclusive'] > region['padded_start']
-                          and f['start'] < region['padded_end']]
+            # Standalone entropy curve (kept for quick viewing)
+            entropy_path = os.path.join(plots_dir, f'region_{i+1}_entropy.png')
+            plot_region_entropy(result, entropy, i, entropy_path)
 
-        # Feature plots (Figure 4g style: filled area + annotations + gene track)
-        features_path = os.path.join(plots_dir, f'region_{i+1}_features.png')
-        plot_region_figure4g(
-            result, i, features_path, annotations,
-            entropy=entropy, gtf_features=region_gtf,
-            n_plot_features=args.n_plot_features,
-            chrom=args.chrom,
-        )
+            if (i + 1) % 10 == 0:
+                logger.info(f"  Generated plots for {i+1}/{n_plot} regions")
 
-        # Standalone entropy curve (kept for quick viewing)
-        entropy_path = os.path.join(plots_dir, f'region_{i+1}_entropy.png')
-        plot_region_entropy(result, entropy, i, entropy_path)
-
-        if (i + 1) % 10 == 0:
-            logger.info(f"  Generated plots for {i+1}/{n_plot} regions")
-
-    logger.info(f"Generated {n_plot * 2} per-region plots ({len(results)} total regions for analysis)")
+        logger.info(f"Generated {n_plot * 2} per-region plots ({len(results)} total regions for analysis)")
 
     # Signature summary
     summary_path = os.path.join(plots_dir, 'signature_summary.png')

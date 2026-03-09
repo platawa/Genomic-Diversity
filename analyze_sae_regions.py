@@ -1244,6 +1244,9 @@ Examples:
                         help="Skip Leiden clustering and embedding")
     parser.add_argument("--random_state", type=int, default=42,
                         help="Random seed (default: 42)")
+    parser.add_argument("--global_stats", type=str, default=None,
+                        help="Path to global_feature_stats.npz for genome-wide normalization "
+                             "of max-pooled vectors before similarity/clustering")
     parser.add_argument("--log_level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
@@ -1286,6 +1289,18 @@ Examples:
     pooled_vectors, n_regions = load_and_pool_feature_matrices(
         npz_path, pool_method=args.pool_method, logger=logger
     )
+
+    # Optional: apply genome-wide normalization
+    if args.global_stats:
+        logger.info(f"Applying genome-wide z-score normalization from {args.global_stats}")
+        gstats = dict(np.load(args.global_stats))
+        mean = gstats["mean"]
+        std = gstats["std"]
+        valid = gstats.get("valid_mask", std > 0)
+        normalized = np.zeros_like(pooled_vectors)
+        normalized[:, valid] = (pooled_vectors[:, valid] - mean[valid]) / std[valid]
+        pooled_vectors = normalized
+        logger.info(f"  Normalized range: [{pooled_vectors.min():.4f}, {pooled_vectors.max():.4f}]")
 
     # =========================================================================
     # STEP 2: Load region metadata

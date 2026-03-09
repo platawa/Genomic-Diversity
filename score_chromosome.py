@@ -192,6 +192,7 @@ SMOOTH_W = 51
 ZSCORE_THRESHOLD = 2.5
 MAD_THRESHOLD = 3.0
 MIN_SEPARATION = 75
+BATCH_SIZE = 1  # Number of chunks to batch into a single forward pass
 
 
 # =============================================================================
@@ -538,6 +539,146 @@ def compute_entropy_chunk(
     }
 
 
+@torch.inference_mode()
+def compute_entropy_batch(
+    sequences: List[str],
+    model: Evo2,
+    ACGT_IDS: torch.Tensor,
+    device: str,
+    reverse_complement: bool = False,
+    compute_logprobs: bool = False,
+    use_bf16: bool = False,
+) -> List[Union[np.ndarray, dict]]:
+    """
+    Batch multiple sequence chunks into a single forward pass for higher GPU
+    utilization.  Sequences are right-padded to the length of the longest
+    sequence in the batch; padding positions are masked out before returning.
+
+    Args:
+        sequences: List of DNA sequence strings (ACGT only, no N's).
+        model: Evo2 model instance.
+        ACGT_IDS: Token IDs for A, C, G, T.
+        device: Compute device.
+        reverse_complement: If True, also compute RC entropy and average.
+        compute_logprobs: If True, return dicts with entropy, P(ACGT), ll_next.
+        use_bf16: If True, run forward pass under bfloat16 autocast.
+
+    Returns:
+        List of results, one per input sequence, in the same format as
+        compute_entropy_chunk (ndarray or dict depending on compute_logprobs).
+    """
+    if len(sequences) == 0:
+        return []
+    if len(sequences) == 1:
+        return [compute_entropy_chunk(
+            sequences[0], model, ACGT_IDS, device,
+            reverse_complement=reverse_complement,
+            compute_logprobs=compute_logprobs,
+        )]
+
+    tok = model.tokenizer
+    _acgt_ids = ACGT_IDS.to(device)
+    bos = _bos_id(tok)
+
+    def _tokenize_seqs(seqs):
+        """Tokenize and right-pad a list of sequences. Returns (input_ids, lengths)."""
+        all_toks = []
+        lengths = []
+        for seq in seqs:
+            t = [bos] + tok.tokenize(seq)
+            all_toks.append(t)
+            lengths.append(len(t))
+        max_len = max(lengths)
+        # Pad with BOS token (value doesn't matter, will be masked)
+        padded = [t + [bos] * (max_len - len(t)) for t in all_toks]
+        input_ids = torch.tensor(padded, dtype=torch.long, device=device)
+        return input_ids, lengths
+
+    def _forward_batch(seqs):
+        """Run a batched forward pass and extract per-sequence results."""
+        input_ids, lengths = _tokenize_seqs(seqs)
+        B = input_ids.shape[0]
+
+        if use_bf16:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = model(input_ids)
+        else:
+            out = model(input_ids)
+        logits = _extract_logits(out).float()  # [B, T, V]
+
+        # ACGT entropy
+        logits_sub = logits.index_select(-1, _acgt_ids)  # [B, T, 4]
+        logZ = torch.logsumexp(logits_sub, dim=-1, keepdim=True)
+        logp = logits_sub - logZ
+        H = -(logp.exp() * logp).sum(dim=-1)  # [B, T]
+        H = H[:, 1:]  # Remove BOS position, [B, T-1]
+        H_np = H.detach().cpu().numpy()
+
+        if compute_logprobs:
+            p_acgt_all = logp.exp()[:, 1:, :].detach().cpu().numpy()  # [B, T-1, 4]
+            full_lp = torch.log_softmax(logits, dim=-1)  # [B, T, V]
+            ll_all = full_lp[:, :-1, :].gather(
+                -1, input_ids[:, 1:].unsqueeze(-1)
+            ).squeeze(-1).detach().cpu().numpy()  # [B, T-1]
+
+        results = []
+        for i in range(B):
+            seq_len = lengths[i] - 1  # Exclude BOS from output length
+            ent = H_np[i, :seq_len].copy()
+
+            if not compute_logprobs:
+                results.append(ent)
+            else:
+                true_ids = input_ids[i, 1:lengths[i]].cpu().tolist()
+                true_tokens = [_id_to_token_str(tok, tid) for tid in true_ids]
+                results.append({
+                    "entropy": ent,
+                    "p_acgt": p_acgt_all[i, :seq_len].copy(),
+                    "ll_next": ll_all[i, :seq_len].copy(),
+                    "true_token": true_tokens,
+                })
+        return results
+
+    if not reverse_complement:
+        return _forward_batch(sequences)
+
+    # With RC: build fwd + RC pairs, batch them all together
+    rc_seqs = [str(Seq(s).reverse_complement()) for s in sequences]
+
+    # Try batching all fwd+RC together (2*N sequences)
+    try:
+        combined = sequences + rc_seqs
+        combined_results = _forward_batch(combined)
+        fwd_results = combined_results[:len(sequences)]
+        rc_results = combined_results[len(sequences):]
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if "out of memory" not in str(e).lower() and not isinstance(e, torch.cuda.OutOfMemoryError):
+            raise
+        # Fallback: run fwd and RC as separate batches
+        torch.cuda.empty_cache()
+        fwd_results = _forward_batch(sequences)
+        rc_results = _forward_batch(rc_seqs)
+
+    # Average fwd and RC
+    final = []
+    for fwd_r, rc_r in zip(fwd_results, rc_results):
+        if not compute_logprobs:
+            final.append(0.5 * (fwd_r + rc_r[::-1]))
+        else:
+            H_avg = 0.5 * (fwd_r["entropy"] + rc_r["entropy"][::-1])
+            p_fwd = fwd_r["p_acgt"]
+            p_rc = rc_r["p_acgt"][::-1, :]
+            p_rc_complement = p_rc[:, [3, 2, 1, 0]]
+            p_avg = 0.5 * (p_fwd + p_rc_complement)
+            final.append({
+                "entropy": H_avg,
+                "p_acgt": p_avg,
+                "ll_next": fwd_r["ll_next"],
+                "true_token": fwd_r["true_token"],
+            })
+    return final
+
+
 def score_chromosome_region(
     sequence: str,
     model: Evo2,
@@ -549,6 +690,8 @@ def score_chromosome_region(
     compute_logprobs: bool = False,
     logger: logging.Logger = None,
     stitch_method: str = "core",
+    batch_size: int = BATCH_SIZE,
+    use_bf16: bool = False,
 ) -> Union[np.ndarray, dict]:
     """
     Score a chromosome region using overlapping chunks.
@@ -570,6 +713,10 @@ def score_chromosome_region(
         compute_logprobs: If True, also return P(ACGT) and LL_next
         logger: Logger instance
         stitch_method: How to handle overlap zones ("core", "mean", "min")
+        batch_size: Number of chunks to batch into a single forward pass.
+            Higher values improve GPU utilization but use more memory.
+        use_bf16: If True, run forward passes under bfloat16 autocast for
+            ~2x memory savings (allows larger chunks/batches).
 
     Returns:
         If compute_logprobs=False: Per-position entropy array (nats)
@@ -644,20 +791,43 @@ def score_chromosome_region(
     if L <= max_chunk_len:
         # Process contiguous non-N runs (vectorized N-boundary detection)
         runs = _find_non_n_runs(sequence)
-        for i, j in runs:
-            run_seq = sequence[i:j]
-            result = compute_entropy_chunk(run_seq, model, ACGT_IDS, device,
-                                           reverse_complement=reverse_complement,
-                                           compute_logprobs=compute_logprobs)
-            ent = _extract_entropy(result)
-            entropy[i:i+len(ent)] = ent
-            if compute_logprobs and isinstance(result, dict):
-                p_acgt[i:i+len(result["p_acgt"])] = result["p_acgt"]
-                n_ll = len(result["ll_next"])
-                ll_next[i:i+n_ll] = result["ll_next"]
-                for ti, t in enumerate(result["true_token"]):
-                    if i + ti < L:
-                        true_token[i + ti] = t
+        # Batch non-N runs together for higher GPU utilization
+        if batch_size > 1 and len(runs) > 1:
+            run_seqs = [sequence[i:j] for i, j in runs]
+            for batch_start in range(0, len(run_seqs), batch_size):
+                batch_seqs = run_seqs[batch_start:batch_start + batch_size]
+                batch_runs = runs[batch_start:batch_start + batch_size]
+                batch_results = compute_entropy_batch(
+                    batch_seqs, model, ACGT_IDS, device,
+                    reverse_complement=reverse_complement,
+                    compute_logprobs=compute_logprobs,
+                    use_bf16=use_bf16,
+                )
+                for (i, j), result in zip(batch_runs, batch_results):
+                    ent = _extract_entropy(result)
+                    entropy[i:i+len(ent)] = ent
+                    if compute_logprobs and isinstance(result, dict):
+                        p_acgt[i:i+len(result["p_acgt"])] = result["p_acgt"]
+                        n_ll = len(result["ll_next"])
+                        ll_next[i:i+n_ll] = result["ll_next"]
+                        for ti, t in enumerate(result["true_token"]):
+                            if i + ti < L:
+                                true_token[i + ti] = t
+        else:
+            for i, j in runs:
+                run_seq = sequence[i:j]
+                result = compute_entropy_chunk(run_seq, model, ACGT_IDS, device,
+                                               reverse_complement=reverse_complement,
+                                               compute_logprobs=compute_logprobs)
+                ent = _extract_entropy(result)
+                entropy[i:i+len(ent)] = ent
+                if compute_logprobs and isinstance(result, dict):
+                    p_acgt[i:i+len(result["p_acgt"])] = result["p_acgt"]
+                    n_ll = len(result["ll_next"])
+                    ll_next[i:i+n_ll] = result["ll_next"]
+                    for ti, t in enumerate(result["true_token"]):
+                        if i + ti < L:
+                            true_token[i + ti] = t
 
         if not compute_logprobs:
             return entropy

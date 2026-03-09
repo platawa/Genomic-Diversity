@@ -168,9 +168,16 @@ def plot_figure4c(
     entropy_start=0,
     output_path="figure4c.png",
     chrom="",
-    figsize_width=40,
+    figsize_width=30,
 ):
-    """Create a Figure 4C-style stacked SAE feature activation plot.
+    """Create a Figure 4g-style stacked SAE feature activation plot.
+
+    Matches the Evo2 paper Figure 4g visual style:
+      - Blue filled area plots for each feature
+      - Orange labels for known bio features, gray for others
+      - Gray exon/CDS shading behind traces
+      - Scoring-style annotation track at bottom
+      - Optional entropy panel
 
     Args:
         feature_matrix: np.ndarray (seq_len, n_total_features) — SAE activations
@@ -187,7 +194,17 @@ def plot_figure4c(
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle, Patch
+    from matplotlib.ticker import FuncFormatter
+
+    # Known biological features from the Evo2 paper
+    KNOWN_BIO_FEATURES = {
+        15680: ("CDS",        "coding regions"),
+        28339: ("Intron",     "introns"),
+        1050:  ("Exon start", "first base of exon following intron"),
+        25666: ("Exon end",   "last base of exon followed by intron"),
+        24278: ("Frameshift", "mutation-sensitive, frameshifts & premature stops"),
+        19745: ("Prophage",   "prophage/CRISPR spacer feature"),
+    }
 
     n_features = len(feature_ids)
     has_entropy = entropy is not None
@@ -199,11 +216,11 @@ def plot_figure4c(
     if has_entropy:
         height_ratios.append(1.0)
     if has_genes:
-        height_ratios.append(0.6)
+        height_ratios.append(1.2)
 
     fig, axes = plt.subplots(
         n_panels, 1,
-        figsize=(figsize_width, max(n_panels, 4)),
+        figsize=(figsize_width, 1.0 * n_panels + 0.5),
         sharex=True,
         gridspec_kw={'height_ratios': height_ratios, 'hspace': 0.05},
     )
@@ -214,54 +231,69 @@ def plot_figure4c(
     seq_len = feature_matrix.shape[0]
     x = np.linspace(window_start, window_end, seq_len, endpoint=False)
 
-    # GTF feature colors (from analyze_scoring_results.py)
-    gff_colors = {
-        "CDS":              "#3498db",
-        "gene":             "#2ecc71",
-        "mRNA":             "#1abc9c",
-        "exon":             "#a8e6cf",
-        "transcript":       "#1abc9c",
-        "five_prime_UTR":   "#e67e22",
-        "three_prime_UTR":  "#e74c3c",
-        "start_codon":      "#9b59b6",
-        "stop_codon":       "#8e44ad",
-        "tRNA":             "#662D91",
-        "rRNA":             "#7AC8AC",
-        "ncRNA":            "#95a5a6",
-    }
+    # Color palette (matching Fig 4g)
+    fill_color = '#4A90D9'
+    fill_alpha = 0.85
+    line_color = '#3A7BC8'
+    line_width = 0.3
+    bio_label_color = '#E67E22'    # Orange for known bio features
+    region_label_color = '#555555'  # Gray for others
 
-    # ── Feature trace panels ──
+    # Collect exon/CDS regions for gray shading
+    exon_regions = []
+    if gtf_features:
+        for feat in gtf_features:
+            if feat["feature_type"] in ("exon", "CDS"):
+                s = max(feat["start"], window_start)
+                e = min(feat["end_exclusive"], window_end)
+                if s < e:
+                    exon_regions.append((s, e))
+
+    # ── Feature trace panels (filled area style) ──
     for i, fid in enumerate(feature_ids):
         ax = axes[i]
         trace = feature_matrix[:, fid]
-        ax.plot(x, trace, lw=0.5, color='black', alpha=0.9)
-        ax.set_ylim([0, 5])
-        ax.set_yticks([0, 5])
-        ax.set_ylabel(f"F{fid}", fontsize=8, rotation=0, labelpad=30, va='center')
-        ax.tick_params(axis='y', labelsize=7)
 
-        # Gene region shading on feature panels
-        if gtf_features:
-            for feat in gtf_features:
-                if feat["feature_type"] == "gene":
-                    s = max(feat["start"], window_start)
-                    e = min(feat["end_exclusive"], window_end)
-                    ax.axvspan(s, e, alpha=0.08, facecolor="#2ecc71", edgecolor="none")
+        # Gray exon/CDS shading behind traces
+        for s, e in exon_regions:
+            ax.axvspan(s, e, alpha=0.12, facecolor='#888888', edgecolor='none', zorder=0)
 
-        # Remove top/right spines for clean look
+        # Filled area plot
+        ax.fill_between(x, 0, trace, facecolor=fill_color, alpha=fill_alpha,
+                         edgecolor=line_color, linewidth=line_width)
+
+        # Auto y-limit based on data
+        ymax = max(np.percentile(trace[trace > 0], 99) if np.any(trace > 0) else 3, 3)
+        ax.set_ylim([0, ymax])
+        ax.set_yticks([0, int(ymax)])
+
+        # Label: orange for known bio features, gray for others
+        is_bio = fid in KNOWN_BIO_FEATURES
+        if is_bio:
+            bio_name = KNOWN_BIO_FEATURES[fid][0]
+            label = f"{bio_name}\nf/{fid}"
+            label_color = bio_label_color
+        else:
+            label = f"f/{fid}"
+            label_color = region_label_color
+        ax.set_ylabel(label, fontsize=8, rotation=0, labelpad=50,
+                       va='center', fontweight='bold', color=label_color)
+
+        # "Feature activations" on right side of middle panel
+        if i == n_features // 2:
+            ax2 = ax.twinx()
+            ax2.set_ylabel("Feature activations", fontsize=10, rotation=270,
+                           labelpad=15, color='#555555')
+            ax2.set_yticks([])
+
+        ax.tick_params(axis='y', labelsize=6)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
-
-        # Only show x labels on bottom panel
-        if i < n_features - 1 and not (has_entropy or has_genes):
-            pass  # last feature panel will get x label
         ax.tick_params(axis='x', labelbottom=False)
 
     # ── Entropy panel (optional) ──
-    entropy_ax_idx = n_features if has_entropy else None
     if has_entropy:
-        ax = axes[entropy_ax_idx]
-        # Extract entropy for this window
+        ax = axes[n_features]
         ent_start_idx = window_start - entropy_start
         ent_end_idx = window_end - entropy_start
         ent_start_idx = max(0, ent_start_idx)
@@ -269,59 +301,79 @@ def plot_figure4c(
         ent_slice = entropy[ent_start_idx:ent_end_idx]
         ent_x = np.linspace(window_start, window_end, len(ent_slice), endpoint=False)
 
-        ax.plot(ent_x, ent_slice, lw=0.4, color='#2c3e50', alpha=0.8)
-        ax.set_ylabel("Entropy", fontsize=8, rotation=0, labelpad=30, va='center')
-        ax.tick_params(axis='y', labelsize=7)
+        # Gray exon shading on entropy too
+        for s, e in exon_regions:
+            ax.axvspan(s, e, alpha=0.12, facecolor='#888888', edgecolor='none', zorder=0)
+
+        ax.fill_between(ent_x, 0, ent_slice, facecolor='#2c3e50', alpha=0.5,
+                         edgecolor='#2c3e50', linewidth=0.3)
+        ax.set_ylabel("Entropy", fontsize=8, rotation=0, labelpad=50,
+                       va='center', fontweight='bold', color='#555555')
+        ax.tick_params(axis='y', labelsize=6)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
-
-        # Gene shading
-        if gtf_features:
-            for feat in gtf_features:
-                if feat["feature_type"] == "gene":
-                    s = max(feat["start"], window_start)
-                    e = min(feat["end_exclusive"], window_end)
-                    ax.axvspan(s, e, alpha=0.08, facecolor="#2ecc71", edgecolor="none")
-
         ax.tick_params(axis='x', labelbottom=False)
 
-    # ── Gene track panel (bottom) ──
+    # ── Gene track panel (scoring style: colored rows per feature type) ──
     if has_genes:
         gene_ax = axes[-1]
-
-        # Import and use draw_gene_track from analyze_scoring_results
-        sys.path.insert(0, os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools'))
-        from analyze_scoring_results import draw_gene_track
-        draw_gene_track(gene_ax, gtf_features, window_start, window_end)
+        try:
+            sys.path.insert(0, os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools'))
+            from analyze_scoring_results import draw_gene_track
+            draw_gene_track(gene_ax, gtf_features, window_start, window_end)
+        except ImportError:
+            from matplotlib.patches import Rectangle, Patch
+            _gff_colors = {
+                "CDS": "#3498db", "gene": "#2ecc71", "exon": "#a8e6cf",
+                "transcript": "#1abc9c", "five_prime_UTR": "#e67e22",
+                "three_prime_UTR": "#e74c3c",
+            }
+            vis = [f for f in gtf_features
+                   if f["start"] < window_end and f["end_exclusive"] > window_start]
+            types_present = sorted(set(f["feature_type"] for f in vis))
+            n_types = max(len(types_present), 1)
+            sub_h = 1.0 / n_types
+            type_to_row = {ft: i for i, ft in enumerate(types_present)}
+            gene_ax.set_ylim(0, 1)
+            gene_ax.set_yticks([])
+            for feat in vis:
+                row = type_to_row[feat["feature_type"]]
+                color = _gff_colors.get(feat["feature_type"], "#95a5a6")
+                s = max(feat["start"], window_start)
+                e = min(feat["end_exclusive"], window_end)
+                gene_ax.add_patch(Rectangle(
+                    (s, row * sub_h + sub_h * 0.075), e - s, sub_h * 0.85,
+                    facecolor=color, edgecolor="none", alpha=0.85))
 
         gene_ax.set_xlim(window_start, window_end)
+        gene_ax.set_ylabel("Annotations", fontsize=8, rotation=0, labelpad=50,
+                           va='center', color='#555555')
         gene_ax.tick_params(axis='x', labelbottom=True, labelsize=8)
-        gene_ax.set_xlabel(f"Genomic position ({chrom})", fontsize=10)
+        gene_ax.set_xlabel(f"Position (bp)", fontsize=10)
     else:
-        # x label on last panel
         axes[-1].tick_params(axis='x', labelbottom=True, labelsize=8)
-        axes[-1].set_xlabel(f"Genomic position ({chrom})", fontsize=10)
+        axes[-1].set_xlabel(f"Position (bp)", fontsize=10)
 
     # Set shared x limits
     for ax in axes:
         ax.set_xlim(window_start, window_end)
 
-    # Format x-axis ticks as Mb
-    from matplotlib.ticker import FuncFormatter
-    def mb_formatter(x, pos):
-        return f"{x/1e6:.2f} Mb"
-    axes[-1].xaxis.set_major_formatter(FuncFormatter(mb_formatter))
+    # Format x-axis ticks
+    def _fmt_pos(v, _):
+        return f"{int(v):,}"
+    axes[-1].xaxis.set_major_formatter(FuncFormatter(_fmt_pos))
 
-    # Title
+    # Title — inside the figure, tight to top
     window_kb = (window_end - window_start) / 1000
-    fig.suptitle(
+    axes[0].set_title(
         f"SAE Feature Activations — {chrom} "
         f"{window_start:,}-{window_end:,} ({window_kb:.0f} kb)",
-        fontsize=13, fontweight='bold', y=1.01,
+        fontsize=11, fontweight='bold', pad=4,
     )
 
-    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.savefig(output_path, dpi=200, bbox_inches='tight',
+                facecolor='white', pad_inches=0.1)
     plt.close(fig)
     logger.info(f"Saved figure: {output_path}")
 
