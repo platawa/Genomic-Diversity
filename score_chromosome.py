@@ -842,44 +842,114 @@ def score_chromosome_region(
     n_chunks = len(chunk_starts)
 
     if logger:
-        logger.info(f"Processing {n_chunks} chunks (max_len={max_chunk_len}, overlap={chunk_overlap})")
+        logger.info(f"Processing {n_chunks} chunks (max_len={max_chunk_len}, "
+                     f"overlap={chunk_overlap}, batch_size={batch_size}"
+                     f"{', bf16' if use_bf16 else ''})")
 
-    scoring_start = time.time()
+    # Pre-compute chunk metadata
+    chunk_meta = []
     for i, s in enumerate(chunk_starts):
         e = min(s + max_chunk_len, L)
-        chunk_seq = sequence[s:e]
-
-        # Core region bounds depend on stitch method
         if stitch_method == "core":
             core_s = s if s == 0 else s + chunk_overlap // 2
             core_e = e if e == L else e - chunk_overlap // 2
         else:
-            # mean/min: use full chunk, handle overlap in accumulation
             core_s = s
             core_e = e
         core_s = min(core_s, core_e)
+        chunk_meta.append((i, s, e, core_s, core_e))
 
-        if logger and (i % 10 == 0 or i == n_chunks - 1):
-            elapsed = time.time() - scoring_start
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            eta = (n_chunks - i - 1) / rate if rate > 0 else 0
-            logger.info(f"  Chunk {i+1}/{n_chunks}: positions {s:,}-{e:,} "
-                        f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
+    scoring_start = time.time()
 
-        # Process contiguous non-N runs within this chunk (vectorized)
-        runs = _find_non_n_runs(chunk_seq)
-        for ci, cj in runs:
-            run_seq = chunk_seq[ci:cj]
+    if batch_size > 1:
+        # Batched scoring: collect non-N runs from multiple chunks, score
+        # them together in a single forward pass for higher GPU utilization.
+        # We accumulate runs across chunks until we have batch_size sequences,
+        # then score them all at once.
+        pending_seqs = []      # sequences to score
+        pending_meta = []      # (chunk_idx, ci, cj, s, core_s, core_e)
+
+        def _flush_batch():
+            """Score all pending sequences in one batched forward pass."""
+            if not pending_seqs:
+                return
             try:
-                result = compute_entropy_chunk(run_seq, model, ACGT_IDS, device,
-                                               reverse_complement=reverse_complement,
-                                               compute_logprobs=compute_logprobs)
+                results = compute_entropy_batch(
+                    pending_seqs, model, ACGT_IDS, device,
+                    reverse_complement=reverse_complement,
+                    compute_logprobs=compute_logprobs,
+                    use_bf16=use_bf16,
+                )
+                for result, (_, ci, cj, s, core_s, core_e) in zip(results, pending_meta):
+                    _write_core(result, ci, cj, s, core_s, core_e)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as ex:
+                if "out of memory" not in str(ex).lower() and not isinstance(ex, torch.cuda.OutOfMemoryError):
+                    raise
+                # OOM fallback: score one at a time
+                torch.cuda.empty_cache()
+                if logger:
+                    logger.warning(f"  Batch OOM with {len(pending_seqs)} seqs, "
+                                   f"falling back to sequential")
+                for seq, (_, ci, cj, s, core_s, core_e) in zip(pending_seqs, pending_meta):
+                    try:
+                        result = compute_entropy_chunk(
+                            seq, model, ACGT_IDS, device,
+                            reverse_complement=reverse_complement,
+                            compute_logprobs=compute_logprobs,
+                        )
+                        _write_core(result, ci, cj, s, core_s, core_e)
+                    except Exception as inner_ex:
+                        if logger:
+                            logger.error(f"  Run scoring failed: {inner_ex}")
             except Exception as ex:
                 if logger:
-                    logger.error(f"  Chunk {i+1} run scoring failed: {ex}")
-                continue
+                    logger.error(f"  Batch scoring failed: {ex}")
+            pending_seqs.clear()
+            pending_meta.clear()
 
-            _write_core(result, ci, cj, s, core_s, core_e)
+        for i, s, e, core_s, core_e in chunk_meta:
+            chunk_seq = sequence[s:e]
+            runs = _find_non_n_runs(chunk_seq)
+            for ci, cj in runs:
+                pending_seqs.append(chunk_seq[ci:cj])
+                pending_meta.append((i, ci, cj, s, core_s, core_e))
+                if len(pending_seqs) >= batch_size:
+                    _flush_batch()
+
+            if logger and (i % 10 == 0 or i == n_chunks - 1):
+                elapsed = time.time() - scoring_start
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                eta = (n_chunks - i - 1) / rate if rate > 0 else 0
+                logger.info(f"  Chunk {i+1}/{n_chunks}: positions {s:,}-{e:,} "
+                            f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
+
+        # Flush remaining
+        _flush_batch()
+    else:
+        # Original sequential scoring (batch_size=1)
+        for i, s, e, core_s, core_e in chunk_meta:
+            chunk_seq = sequence[s:e]
+
+            if logger and (i % 10 == 0 or i == n_chunks - 1):
+                elapsed = time.time() - scoring_start
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                eta = (n_chunks - i - 1) / rate if rate > 0 else 0
+                logger.info(f"  Chunk {i+1}/{n_chunks}: positions {s:,}-{e:,} "
+                            f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
+
+            runs = _find_non_n_runs(chunk_seq)
+            for ci, cj in runs:
+                run_seq = chunk_seq[ci:cj]
+                try:
+                    result = compute_entropy_chunk(run_seq, model, ACGT_IDS, device,
+                                                   reverse_complement=reverse_complement,
+                                                   compute_logprobs=compute_logprobs)
+                except Exception as ex:
+                    if logger:
+                        logger.error(f"  Chunk {i+1} run scoring failed: {ex}")
+                    continue
+
+                _write_core(result, ci, cj, s, core_s, core_e)
 
     # Post-process experimental stitch methods
     if stitch_method == "mean":
@@ -919,6 +989,8 @@ def _chromosome_gpu_worker(
     stitch_method: str = "core",
     result_shm_alt_name: str = None,
     use_torch_compile: bool = False,
+    batch_size: int = 1,
+    use_bf16: bool = False,
 ):
     """
     Worker process that loads a model on a specific GPU and scores assigned chunks.
@@ -1028,7 +1100,11 @@ def _chromosome_gpu_worker(
         bos = getattr(tok, "bos_id", getattr(tok, "eod_id", None))
         toks_list = [bos] + toks_list
         input_ids = _torch.tensor(toks_list, dtype=_torch.long, device=device).unsqueeze(0)
-        out = model(input_ids)
+        if use_bf16:
+            with _torch.autocast("cuda", dtype=_torch.bfloat16):
+                out = model(input_ids)
+        else:
+            out = model(input_ids)
 
         # Extract logits robustly (reuse module-level helper that
         # recursively unwraps nested tuples from Evo2/Vortex)
@@ -1077,7 +1153,11 @@ def _chromosome_gpu_worker(
         toks_fwd = [bos] + tok.tokenize(seq_fwd)
         toks_rc = [bos] + tok.tokenize(seq_rc)
         input_ids = _torch.tensor([toks_fwd, toks_rc], dtype=_torch.long, device=device)
-        out = model(input_ids)
+        if use_bf16:
+            with _torch.autocast("cuda", dtype=_torch.bfloat16):
+                out = model(input_ids)
+        else:
+            out = model(input_ids)
         logits = _extract_logits(out).float()  # [2, T, V]
 
         # ACGT entropy for both
@@ -1114,117 +1194,281 @@ def _chromosome_gpu_worker(
     # Track whether batched RC works (OOM falls back to sequential)
     _batched_rc_ok = True
 
+    def _batched_multi_forward(seqs):
+        """Batched forward pass for multiple sequences (variable length, right-padded).
+
+        Returns list of results in the same format as _forward_pass.
+        """
+        bos = getattr(tok, "bos_id", getattr(tok, "eod_id", None))
+        all_toks = []
+        lengths = []
+        for seq in seqs:
+            t = [bos] + tok.tokenize(seq)
+            all_toks.append(t)
+            lengths.append(len(t))
+        max_len = max(lengths)
+        padded = [t + [bos] * (max_len - len(t)) for t in all_toks]
+        input_ids = _torch.tensor(padded, dtype=_torch.long, device=device)
+
+        if use_bf16:
+            with _torch.autocast("cuda", dtype=_torch.bfloat16):
+                out = model(input_ids)
+        else:
+            out = model(input_ids)
+        logits = _extract_logits(out).float()
+
+        logits_sub = logits.index_select(-1, ACGT_IDS.to(logits.device))
+        logZ = _torch.logsumexp(logits_sub, dim=-1, keepdim=True)
+        logp = logits_sub - logZ
+        H = -(logp.exp() * logp).sum(dim=-1)
+        H = H[:, 1:]
+        H_np = H.detach().cpu().numpy()
+
+        if compute_logprobs:
+            p_acgt_all = logp.exp()[:, 1:, :].detach().cpu().numpy()
+            full_lp = _torch.log_softmax(logits, dim=-1)
+            ll_all = full_lp[:, :-1, :].gather(
+                -1, input_ids[:, 1:].unsqueeze(-1)
+            ).squeeze(-1).detach().cpu().numpy()
+
+        results = []
+        for idx in range(len(seqs)):
+            seq_len = lengths[idx] - 1
+            ent = H_np[idx, :seq_len].copy()
+            if not compute_logprobs:
+                results.append(ent)
+            else:
+                true_ids = input_ids[idx, 1:lengths[idx]].cpu().tolist()
+                true_toks = [_id_to_str(tid) for tid in true_ids]
+                results.append({
+                    "entropy": ent,
+                    "p_acgt": p_acgt_all[idx, :seq_len].copy(),
+                    "ll_next": ll_all[idx, :seq_len].copy(),
+                    "true_token": true_toks,
+                })
+        return results
+
+    def _score_single_chunk(chunk_seq):
+        """Score a single chunk, handling RC if needed. Returns (entropy, p_acgt, ll)."""
+        nonlocal _batched_rc_ok
+        if reverse_complement:
+            seq_rc = str(_Seq(chunk_seq).reverse_complement())
+            if _batched_rc_ok:
+                try:
+                    result_fwd, result_rc = _batched_fwd_rc_pass(chunk_seq, seq_rc)
+                except (_torch.cuda.OutOfMemoryError, RuntimeError) as batch_exc:
+                    if isinstance(batch_exc, _torch.cuda.OutOfMemoryError) or "out of memory" in str(batch_exc).lower():
+                        _torch.cuda.empty_cache()
+                        _batched_rc_ok = False
+                        print(f"[GPU {gpu_id}] Batched fwd+RC OOM, falling back to sequential")
+                        result_fwd = _forward_pass(chunk_seq)
+                        result_rc = _forward_pass(seq_rc)
+                    else:
+                        raise
+            else:
+                result_fwd = _forward_pass(chunk_seq)
+                result_rc = _forward_pass(seq_rc)
+
+            if not compute_logprobs:
+                return 0.5 * (result_fwd + result_rc[::-1]), None, None
+            else:
+                chunk_entropy = 0.5 * (result_fwd["entropy"] + result_rc["entropy"][::-1])
+                p_rc = result_rc["p_acgt"][::-1, :]
+                p_rc_complement = p_rc[:, [3, 2, 1, 0]]
+                chunk_p_acgt = 0.5 * (result_fwd["p_acgt"] + p_rc_complement)
+                return chunk_entropy, chunk_p_acgt, result_fwd["ll_next"]
+        else:
+            result_fwd = _forward_pass(chunk_seq)
+            if not compute_logprobs:
+                return result_fwd, None, None
+            else:
+                return result_fwd["entropy"], result_fwd["p_acgt"], result_fwd["ll_next"]
+
+    def _score_batch_chunks(batch_seqs):
+        """Score multiple chunks in a single batched forward pass, handling RC."""
+        if reverse_complement:
+            rc_seqs = [str(_Seq(s).reverse_complement()) for s in batch_seqs]
+            combined = batch_seqs + rc_seqs
+            combined_results = _batched_multi_forward(combined)
+            fwd_results = combined_results[:len(batch_seqs)]
+            rc_results = combined_results[len(batch_seqs):]
+
+            out = []
+            for fwd_r, rc_r in zip(fwd_results, rc_results):
+                if not compute_logprobs:
+                    out.append((0.5 * (fwd_r + rc_r[::-1]), None, None))
+                else:
+                    h_avg = 0.5 * (fwd_r["entropy"] + rc_r["entropy"][::-1])
+                    p_rc = rc_r["p_acgt"][::-1, :]
+                    p_rc_complement = p_rc[:, [3, 2, 1, 0]]
+                    p_avg = 0.5 * (fwd_r["p_acgt"] + p_rc_complement)
+                    out.append((h_avg, p_avg, fwd_r["ll_next"]))
+            return out
+        else:
+            results = _batched_multi_forward(batch_seqs)
+            out = []
+            for r in results:
+                if not compute_logprobs:
+                    out.append((r, None, None))
+                else:
+                    out.append((r["entropy"], r["p_acgt"], r["ll_next"]))
+            return out
+
+    def _write_chunk_to_shm(chunk_idx, s, core_s, core_e,
+                             chunk_entropy, chunk_p_acgt, chunk_ll,
+                             non_acgt_positions):
+        """NaN out bad positions and write results to shared memory."""
+        nonlocal n_scored
+        n_bad = len(non_acgt_positions)
+        if n_bad > 0:
+            for pos in non_acgt_positions:
+                if pos < len(chunk_entropy):
+                    chunk_entropy[pos] = _np.nan
+                if chunk_p_acgt is not None and pos < len(chunk_p_acgt):
+                    chunk_p_acgt[pos] = _np.nan
+                if chunk_ll is not None and pos < len(chunk_ll):
+                    chunk_ll[pos] = _np.nan
+
+        local_s = core_s - s
+        local_e = core_e - s
+        if local_e > local_s and local_e <= len(chunk_entropy):
+            if stitch_method != "core" and entropy_out_alt is not None:
+                target = entropy_out if chunk_idx % 2 == 0 else entropy_out_alt
+            else:
+                target = entropy_out
+            target[core_s:core_e] = chunk_entropy[local_s:local_e]
+            n_scored += core_e - core_s
+
+            if chunk_p_acgt is not None and p_acgt_out is not None:
+                if local_e <= len(chunk_p_acgt):
+                    p_acgt_out[core_s:core_e] = chunk_p_acgt[local_s:local_e]
+            if chunk_ll is not None and ll_next_out is not None:
+                if local_e <= len(chunk_ll):
+                    ll_next_out[core_s:core_e] = chunk_ll[local_s:local_e]
+
     t0 = _time.time()
     n_scored = 0
     n_skipped = 0
 
-    for i, (chunk_idx, s, e, core_s, core_e) in enumerate(work_items):
-        chunk_seq = sequence[s:e]
-        chunk_len = e - s
+    bf16_label = " bf16" if use_bf16 else ""
+    batch_label = f" batch={batch_size}" if batch_size > 1 else ""
+    print(f"[GPU {gpu_id}] Scoring mode:{bf16_label}{batch_label}")
 
-        # Handle non-ACGT characters
-        non_acgt_positions = [m.start() for m in non_acgt_re.finditer(chunk_seq)]
-        n_bad = len(non_acgt_positions)
+    if batch_size > 1:
+        # Batched processing: accumulate chunks and score together
+        pending_seqs = []
+        pending_meta = []  # (chunk_idx, s, core_s, core_e, non_acgt_positions)
+        chunks_processed = 0
 
-        if n_bad > 0 and n_bad / chunk_len > 0.5:
-            n_skipped += 1
-            continue
-
-        if n_bad > 0:
-            chunk_seq = non_acgt_re.sub(
-                lambda m: bases[_np.random.randint(4)], chunk_seq
-            )
-
-        try:
-            with _torch.inference_mode():
-                if reverse_complement:
-                    seq_rc = str(_Seq(chunk_seq).reverse_complement())
-
-                    # Try batched fwd+RC (batch=2, single model call)
-                    if _batched_rc_ok:
+        def _flush_worker_batch():
+            nonlocal n_skipped
+            if not pending_seqs:
+                return
+            try:
+                with _torch.inference_mode():
+                    batch_results = _score_batch_chunks(pending_seqs)
+                for (chunk_entropy, chunk_p_acgt, chunk_ll), \
+                    (ci, cs, c_core_s, c_core_e, nap) in zip(batch_results, pending_meta):
+                    _write_chunk_to_shm(ci, cs, c_core_s, c_core_e,
+                                         chunk_entropy, chunk_p_acgt, chunk_ll, nap)
+            except (_torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+                if isinstance(exc, _torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower():
+                    _torch.cuda.empty_cache()
+                    print(f"[GPU {gpu_id}] Batch OOM ({len(pending_seqs)} seqs), "
+                          f"falling back to sequential")
+                    # Fallback: score one at a time
+                    for seq, (ci, cs, c_core_s, c_core_e, nap) in zip(pending_seqs, pending_meta):
                         try:
-                            result_fwd, result_rc = _batched_fwd_rc_pass(chunk_seq, seq_rc)
-                        except (_torch.cuda.OutOfMemoryError, RuntimeError) as batch_exc:
-                            if isinstance(batch_exc, _torch.cuda.OutOfMemoryError) or "out of memory" in str(batch_exc).lower():
-                                _torch.cuda.empty_cache()
-                                _batched_rc_ok = False
-                                print(f"[GPU {gpu_id}] Batched fwd+RC OOM, falling back to sequential")
-                                result_fwd = _forward_pass(chunk_seq)
-                                result_rc = _forward_pass(seq_rc)
-                            else:
-                                raise
-                    else:
-                        result_fwd = _forward_pass(chunk_seq)
-                        result_rc = _forward_pass(seq_rc)
-
-                    if not compute_logprobs:
-                        chunk_entropy = 0.5 * (result_fwd + result_rc[::-1])
-                        chunk_p_acgt = None
-                        chunk_ll = None
-                    else:
-                        chunk_entropy = 0.5 * (result_fwd["entropy"] +
-                                               result_rc["entropy"][::-1])
-                        p_rc = result_rc["p_acgt"][::-1, :]
-                        p_rc_complement = p_rc[:, [3, 2, 1, 0]]
-                        chunk_p_acgt = 0.5 * (result_fwd["p_acgt"] + p_rc_complement)
-                        chunk_ll = result_fwd["ll_next"]
+                            with _torch.inference_mode():
+                                chunk_entropy, chunk_p_acgt, chunk_ll = _score_single_chunk(seq)
+                            _write_chunk_to_shm(ci, cs, c_core_s, c_core_e,
+                                                 chunk_entropy, chunk_p_acgt, chunk_ll, nap)
+                        except Exception as inner_exc:
+                            print(f"[GPU {gpu_id}] Error on chunk {ci}: {inner_exc}")
+                            n_skipped += 1
                 else:
-                    result_fwd = _forward_pass(chunk_seq)
-                    if not compute_logprobs:
-                        chunk_entropy = result_fwd
-                        chunk_p_acgt = None
-                        chunk_ll = None
-                    else:
-                        chunk_entropy = result_fwd["entropy"]
-                        chunk_p_acgt = result_fwd["p_acgt"]
-                        chunk_ll = result_fwd["ll_next"]
+                    raise
+            except Exception as exc:
+                print(f"[GPU {gpu_id}] Batch error: {exc}")
+                n_skipped += len(pending_seqs)
+            pending_seqs.clear()
+            pending_meta.clear()
 
-            # NaN out non-ACGT positions
-            if n_bad > 0:
-                for pos in non_acgt_positions:
-                    if pos < len(chunk_entropy):
-                        chunk_entropy[pos] = _np.nan
-                    if chunk_p_acgt is not None and pos < len(chunk_p_acgt):
-                        chunk_p_acgt[pos] = _np.nan
-                    if chunk_ll is not None and pos < len(chunk_ll):
-                        chunk_ll[pos] = _np.nan
+        for i, (chunk_idx, s, e, core_s, core_e) in enumerate(work_items):
+            chunk_seq = sequence[s:e]
+            chunk_len = e - s
 
-            # Write to shared memory (select layer for experimental stitch)
-            local_s = core_s - s
-            local_e = core_e - s
-            if local_e > local_s and local_e <= len(chunk_entropy):
-                if stitch_method != "core" and entropy_out_alt is not None:
-                    target = entropy_out if chunk_idx % 2 == 0 else entropy_out_alt
-                else:
-                    target = entropy_out
-                target[core_s:core_e] = chunk_entropy[local_s:local_e]
-                n_scored += core_e - core_s
+            non_acgt_positions = [m.start() for m in non_acgt_re.finditer(chunk_seq)]
+            n_bad = len(non_acgt_positions)
 
-                if chunk_p_acgt is not None and p_acgt_out is not None:
-                    if local_e <= len(chunk_p_acgt):
-                        p_acgt_out[core_s:core_e] = chunk_p_acgt[local_s:local_e]
-                if chunk_ll is not None and ll_next_out is not None:
-                    if local_e <= len(chunk_ll):
-                        ll_next_out[core_s:core_e] = chunk_ll[local_s:local_e]
-
-        except (_torch.cuda.OutOfMemoryError, RuntimeError) as exc:
-            if isinstance(exc, _torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower():
-                _torch.cuda.empty_cache()
-                print(f"[GPU {gpu_id}] OOM on chunk {chunk_idx} (pos {s:,}-{e:,}), skipping")
+            if n_bad > 0 and n_bad / chunk_len > 0.5:
                 n_skipped += 1
-            else:
-                raise
-        except Exception as exc:
-            print(f"[GPU {gpu_id}] Error on chunk {chunk_idx}: {exc}")
-            n_skipped += 1
+                continue
 
-        # Progress logging with ETA
-        if (i + 1) % 10 == 0 or i == len(work_items) - 1:
-            elapsed = _time.time() - t0
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            remaining = (len(work_items) - i - 1) / rate if rate > 0 else 0
-            print(f"[GPU {gpu_id}] Chunk {i+1}/{len(work_items)} "
-                  f"({rate:.2f} chunks/s, ETA {remaining/60:.1f} min)")
+            if n_bad > 0:
+                chunk_seq = non_acgt_re.sub(
+                    lambda m: bases[_np.random.randint(4)], chunk_seq
+                )
+
+            pending_seqs.append(chunk_seq)
+            pending_meta.append((chunk_idx, s, core_s, core_e, non_acgt_positions))
+
+            if len(pending_seqs) >= batch_size:
+                _flush_worker_batch()
+                chunks_processed += batch_size
+
+            if (i + 1) % 10 == 0 or i == len(work_items) - 1:
+                elapsed = _time.time() - t0
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                remaining = (len(work_items) - i - 1) / rate if rate > 0 else 0
+                print(f"[GPU {gpu_id}] Chunk {i+1}/{len(work_items)} "
+                      f"({rate:.2f} chunks/s, ETA {remaining/60:.1f} min)")
+
+        _flush_worker_batch()
+
+    else:
+        # Original sequential processing (batch_size=1)
+        for i, (chunk_idx, s, e, core_s, core_e) in enumerate(work_items):
+            chunk_seq = sequence[s:e]
+            chunk_len = e - s
+
+            non_acgt_positions = [m.start() for m in non_acgt_re.finditer(chunk_seq)]
+            n_bad = len(non_acgt_positions)
+
+            if n_bad > 0 and n_bad / chunk_len > 0.5:
+                n_skipped += 1
+                continue
+
+            if n_bad > 0:
+                chunk_seq = non_acgt_re.sub(
+                    lambda m: bases[_np.random.randint(4)], chunk_seq
+                )
+
+            try:
+                with _torch.inference_mode():
+                    chunk_entropy, chunk_p_acgt, chunk_ll = _score_single_chunk(chunk_seq)
+
+                _write_chunk_to_shm(chunk_idx, s, core_s, core_e,
+                                     chunk_entropy, chunk_p_acgt, chunk_ll,
+                                     non_acgt_positions)
+
+            except (_torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+                if isinstance(exc, _torch.cuda.OutOfMemoryError) or "out of memory" in str(exc).lower():
+                    _torch.cuda.empty_cache()
+                    print(f"[GPU {gpu_id}] OOM on chunk {chunk_idx} (pos {s:,}-{e:,}), skipping")
+                    n_skipped += 1
+                else:
+                    raise
+            except Exception as exc:
+                print(f"[GPU {gpu_id}] Error on chunk {chunk_idx}: {exc}")
+                n_skipped += 1
+
+            if (i + 1) % 10 == 0 or i == len(work_items) - 1:
+                elapsed = _time.time() - t0
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                remaining = (len(work_items) - i - 1) / rate if rate > 0 else 0
+                print(f"[GPU {gpu_id}] Chunk {i+1}/{len(work_items)} "
+                      f"({rate:.2f} chunks/s, ETA {remaining/60:.1f} min)")
 
     elapsed = _time.time() - t0
     print(f"[GPU {gpu_id}] Done: {n_scored:,} positions scored, "
@@ -1252,6 +1496,8 @@ def score_chromosome_region_multigpu(
     logger: logging.Logger = None,
     stitch_method: str = "core",
     use_torch_compile: bool = False,
+    batch_size: int = BATCH_SIZE,
+    use_bf16: bool = False,
 ) -> Union[np.ndarray, dict]:
     """
     Multi-GPU data-parallel version of score_chromosome_region.
@@ -1388,7 +1634,9 @@ def score_chromosome_region_multigpu(
                   ll_next_shm.name if ll_next_shm else None,
                   stitch_method,
                   result_shm_alt.name if result_shm_alt else None,
-                  use_torch_compile),
+                  use_torch_compile,
+                  batch_size,
+                  use_bf16),
         )
         processes.append(p)
         active_gpu_ids.append(gid)
@@ -2040,6 +2288,16 @@ Examples:
                         help="Apply torch.compile to the model for fused kernels. "
                              "Can give 10-30%% speedup on the forward pass. "
                              "Falls back gracefully if compilation fails.")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE,
+                        help=f"Number of chunks to batch into a single forward pass "
+                             f"(default: {BATCH_SIZE}). Higher values (4-8) improve "
+                             f"GPU utilization but use more memory. Falls back to "
+                             f"sequential on OOM.")
+    parser.add_argument("--bf16", action="store_true", default=False,
+                        help="Use bfloat16 autocast for forward passes. "
+                             "Halves GPU memory usage, allowing ~2x larger chunks "
+                             "or batch sizes. Entropy computation remains in float32 "
+                             "for numerical stability.")
 
     # Other options
     parser.add_argument("--log_level", type=str, default="INFO",
@@ -2056,6 +2314,10 @@ Examples:
         flags.append("logprobs")
     if args.stitch_method != "core":
         flags.append(f"stitch_{args.stitch_method}")
+    if args.bf16:
+        flags.append("bf16")
+    if args.batch_size > 1:
+        flags.append(f"batch{args.batch_size}")
     gpu_label = f"{args.n_gpus}gpu" if args.n_gpus > 0 else "autogpu"
     flags.append(gpu_label)
     flags_str = "_".join(flags)
