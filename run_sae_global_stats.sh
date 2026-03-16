@@ -13,7 +13,7 @@ set -euo pipefail
 
 PROJECT_DIR="/orcd/data/zhang_f/001/platawa/jan31_files"
 CONDA_ENV="evo2_sep28"
-GPU_PARTITION="mit_normal_gpu"
+GPU_PARTITION="mit_preemptable"
 CPU_PARTITION="mit_normal"
 RESULTS_DIR="${PROJECT_DIR}/results"
 FASTA="/orcd/data/zhang_f/001/platawa/data/MEng_Thesis/ncbi_dataset_all_2/ncbi_dataset/data/GCF_000001405.26/GCF_000001405.26_GRCh38_genomic.fna"
@@ -31,11 +31,8 @@ ALL_CHROMS="chr21 chr22 chrY chr20 chr19 chr18 chr17 chr16 chr15 chr14 chr13 chr
 
 # Time limits per chromosome (max 6h on mit_normal_gpu)
 get_time_limit() {
-    case "$1" in
-        chr21|chr22|chrY) echo "02:00:00" ;;
-        chr19|chr20)      echo "04:00:00" ;;
-        *)                echo "06:00:00" ;;
-    esac
+    # ~7h available before midnight maintenance (conservative from 5PM EST)
+    echo "06:30:00"
 }
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
@@ -61,6 +58,13 @@ mkdir -p "${PROJECT_DIR}/logs"
 SCAN_JOB_IDS=()
 
 for chrom in $CHROMS; do
+    # Skip chromosomes that already have a completed sae_global_stats run
+    completed=$(find "${RESULTS_DIR}/${chrom}/sae_global_stats" -name COMPLETED -print -quit 2>/dev/null)
+    if [[ -n "$completed" ]]; then
+        echo "Skipping ${chrom}: already completed ($(dirname "$completed"))"
+        continue
+    fi
+
     time_limit=$(get_time_limit "$chrom")
     job_name="sae_stats_${chrom}"
     sbatch_file="${PROJECT_DIR}/logs/.${job_name}.sbatch"

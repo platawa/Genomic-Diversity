@@ -43,9 +43,9 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from results_utils import build_run_dir, find_latest_completed, write_completed, write_source
 
-CHUNK_SIZE = 65536
+CHUNK_SIZE = 16384  # 2x original; safe on 44GB GPUs, ~2x fewer forward passes
 OVERLAP = 256
-BATCH_SIZE = 4  # Number of chunks per batched forward pass
+BATCH_SIZE = 2  # Number of chunks per batched forward pass; falls back to 1 on OOM
 N_FEATURES = 32768
 
 ALL_HUMAN_CHROMS = [
@@ -66,10 +66,100 @@ def setup_logging(level="INFO"):
     return logging.getLogger(__name__)
 
 
-def scan_chromosome_stats(sequence, model, sae, chunk_size=CHUNK_SIZE, overlap=OVERLAP):
-    """Scan a chromosome in chunks, tracking per-feature global min and max.
+class _EarlyExitException(Exception):
+    """Abort forward pass after capturing target layer activations."""
+    pass
+
+
+def _get_feature_stats_batch(model, sae, sequences):
+    """Run SAE on a batch of sequences, return per-chunk min/max on GPU.
+
+    Uses early exit after layer 26 to skip blocks 27-47 and the output head,
+    saving ~40% of forward pass compute. Works for any batch size (including 1).
+
+    Returns:
+        List of (chunk_min, chunk_max) numpy arrays, shape (N_FEATURES,) each
+    """
+    import torch
+    from sae_utils import SAE_LAYER_NAME
+
+    layer_name = SAE_LAYER_NAME
+
+    # Tokenize all sequences
+    all_toks = []
+    for seq in sequences:
+        toks = model.tokenizer.tokenize(seq)
+        all_toks.append(torch.tensor(toks, dtype=torch.long))
+
+    # Pad to same length for batching
+    max_len = max(t.shape[0] for t in all_toks)
+    batch = torch.zeros(len(all_toks), max_len, dtype=torch.long, device=model.device)
+    for j, t in enumerate(all_toks):
+        batch[j, :t.shape[0]] = t.to(model.device)
+
+    # Compile SAE encoder once
+    if not getattr(sae, '_encode_compiled', False):
+        try:
+            sae.encode = torch.compile(sae.encode)
+            sae._encode_compiled = True
+        except Exception:
+            sae._encode_compiled = True
+
+    sae_device = next(iter(sae.parameters())).device
+
+    # Early exit: hook on layer 26 captures activations and aborts forward pass
+    # so blocks 27-47 and the LM head never execute
+    captured = {}
+    def _exit_hook(module, input, output):
+        acts = output[0] if isinstance(output, tuple) else output
+        captured['acts'] = acts.detach()
+        raise _EarlyExitException()
+
+    target_module = model.scope._module_dict[layer_name]
+    handle = target_module.register_forward_hook(_exit_hook)
+
+    results = []
+    try:
+        with torch.inference_mode():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                early_exited = False
+                try:
+                    model.model(batch)
+                except _EarlyExitException:
+                    early_exited = True
+
+                if not early_exited and not getattr(model, '_early_exit_warned', False):
+                    logger.warning("Early exit not effective — running full forward pass")
+                    model._early_exit_warned = True
+                elif early_exited and not getattr(model, '_early_exit_logged', False):
+                    logger.info("Early exit after layer 26 active — skipping blocks 27-47")
+                    model._early_exit_logged = True
+
+                layer_acts = captured['acts']  # (batch, seq_len, d_hidden)
+
+                for j in range(len(sequences)):
+                    seq_len = len(all_toks[j])
+                    act_j = layer_acts[j, :seq_len, :].to(sae_device)
+                    features = sae.encode(act_j)  # (seq_len, N_FEATURES)
+
+                    # Min/max on GPU before transfer
+                    chunk_max = features.max(dim=0).values.float().cpu().numpy().astype(np.float64)
+                    chunk_min = features.min(dim=0).values.float().cpu().numpy().astype(np.float64)
+                    results.append((chunk_min, chunk_max))
+
+                del layer_acts
+    finally:
+        handle.remove()
+
+    return results
+
+
+def scan_chromosome_stats(sequence, model, sae, chunk_size=CHUNK_SIZE,
+                          overlap=OVERLAP, batch_size=BATCH_SIZE):
+    """Scan a chromosome in batched chunks, tracking per-feature global min and max.
 
     Only keeps two (32768,) arrays — no per-position or per-chunk storage.
+    Processes multiple chunks per forward pass for better GPU utilization.
 
     Args:
         sequence: DNA string
@@ -77,13 +167,12 @@ def scan_chromosome_stats(sequence, model, sae, chunk_size=CHUNK_SIZE, overlap=O
         sae: BatchTopKTiedSAE instance
         chunk_size: bp per chunk
         overlap: bp overlap between chunks
+        batch_size: number of chunks per batched forward pass
 
     Returns:
         dict with keys: global_min, global_max, global_mean, global_std,
                         n_chunks, genome_length, n_nonzero_chunks
     """
-    from sae_utils import get_feature_ts
-
     genome_len = len(sequence)
     stride = chunk_size - overlap
     n_chunks = max(1, (genome_len - overlap + stride - 1) // stride)
@@ -99,47 +188,67 @@ def scan_chromosome_stats(sequence, model, sae, chunk_size=CHUNK_SIZE, overlap=O
     n_processed = 0
 
     logger.info(f"Scanning {genome_len:,} bp in {n_chunks} chunks "
-                f"({chunk_size} bp, {overlap} bp overlap)")
+                f"({chunk_size} bp, {overlap} bp overlap, batch_size={batch_size})")
 
     t0 = time.time()
-    for i in range(n_chunks):
-        chunk_start = i * stride
-        chunk_end = min(chunk_start + chunk_size, genome_len)
-        chunk_seq = sequence[chunk_start:chunk_end]
+    i = 0
+    while i < n_chunks:
+        # Collect a batch of chunk sequences
+        batch_seqs = []
+        for b in range(batch_size):
+            ci = i + b
+            if ci >= n_chunks:
+                break
+            chunk_start = ci * stride
+            chunk_end = min(chunk_start + chunk_size, genome_len)
+            chunk_seq = sequence[chunk_start:chunk_end]
+            if len(chunk_seq) >= 10:
+                batch_seqs.append(chunk_seq)
 
-        if len(chunk_seq) < 10:
+        if not batch_seqs:
+            i += batch_size
             continue
 
-        # Run SAE → (seq_len, 32768)
-        feature_ts = get_feature_ts(model, sae, chunk_seq)
+        # Process batch — try batched, fall back to sequential on OOM
+        try:
+            stats_list = _get_feature_stats_batch(model, sae, batch_seqs)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                import torch
+                torch.cuda.empty_cache()
+                if batch_size > 1:
+                    logger.warning(f"OOM on batch of {len(batch_seqs)}, "
+                                   f"reducing batch_size to 1 for remaining chunks")
+                    batch_size = 1
+                    # Retry sequentially (still uses early exit)
+                    stats_list = []
+                    for seq in batch_seqs:
+                        stats_list.extend(
+                            _get_feature_stats_batch(model, sae, [seq]))
+                else:
+                    raise  # Single chunk OOM — chunk_size is too large for this GPU
+            else:
+                raise
 
-        # Max-pool this chunk: (32768,)
-        chunk_max = np.max(feature_ts, axis=0).astype(np.float64)
-        # Min-pool this chunk: (32768,)
-        chunk_min = np.min(feature_ts, axis=0).astype(np.float64)
+        for chunk_min, chunk_max in stats_list:
+            np.minimum(global_min, chunk_min, out=global_min)
+            np.maximum(global_max, chunk_max, out=global_max)
 
-        # Update global min/max
-        np.minimum(global_min, chunk_min, out=global_min)
-        np.maximum(global_max, chunk_max, out=global_max)
+            n_processed += 1
+            delta = chunk_max - running_mean
+            running_mean += delta / n_processed
+            delta2 = chunk_max - running_mean
+            running_m2 += delta * delta2
+            n_nonzero_chunks += (chunk_max > 0).astype(np.int64)
 
-        # Welford's online mean/variance on chunk max values
-        n_processed += 1
-        delta = chunk_max - running_mean
-        running_mean += delta / n_processed
-        delta2 = chunk_max - running_mean
-        running_m2 += delta * delta2
+        i += batch_size
 
-        # Track how many chunks have nonzero activation per feature
-        n_nonzero_chunks += (chunk_max > 0).astype(np.int64)
-
-        del feature_ts
-
-        if (i + 1) % 100 == 0:
+        if n_processed > 0 and n_processed % 50 == 0:
             elapsed = time.time() - t0
-            rate = (i + 1) / elapsed
-            eta = (n_chunks - i - 1) / rate if rate > 0 else 0
+            rate = n_processed / elapsed
+            eta = (n_chunks - n_processed) / rate if rate > 0 else 0
             n_active = np.sum(global_max > 0)
-            logger.info(f"  Chunk {i+1}/{n_chunks} ({elapsed:.0f}s elapsed, "
+            logger.info(f"  Chunk {n_processed}/{n_chunks} ({elapsed:.0f}s elapsed, "
                         f"~{eta:.0f}s remaining, {n_active} features active so far)")
 
     elapsed = time.time() - t0
@@ -287,6 +396,9 @@ def main():
                         help=f"Chunk size in bp (default: {CHUNK_SIZE})")
     parser.add_argument("--overlap", type=int, default=OVERLAP,
                         help=f"Overlap between chunks (default: {OVERLAP})")
+    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE,
+                        help=f"Chunks per batched forward pass (default: {BATCH_SIZE}). "
+                             f"Falls back to sequential on OOM.")
     parser.add_argument("--log_level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
@@ -386,7 +498,7 @@ def main():
 
         # Scan
         stats = scan_chromosome_stats(
-            sequence, model, sae,
+            sequence, model, sae, batch_size=args.batch_size,
             chunk_size=args.chunk_size, overlap=args.overlap,
         )
 
