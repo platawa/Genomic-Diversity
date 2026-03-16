@@ -260,7 +260,7 @@ class ObservableEvo2:
     @property
     def dtype(self) -> torch.dtype:
         """Get the model's dtype."""
-        return self.evo_model.dtype
+        return next(self.evo_model.model.parameters()).dtype
 
     def list_modules(self) -> List[str]:
         """List all hookable modules in the model."""
@@ -659,14 +659,23 @@ def get_feature_ts(
     toks = model.tokenizer.tokenize(seq)
     toks = torch.tensor(toks, dtype=torch.long).unsqueeze(0).to(model.device)
 
+    # Compile SAE encoder once on first call for fused kernels
+    if not getattr(sae, '_encode_compiled', False):
+        try:
+            sae.encode = torch.compile(sae.encode)
+            sae._encode_compiled = True
+        except Exception:
+            sae._encode_compiled = True  # Don't retry on failure
+
     # Forward pass with activation caching (inference_mode required
     # because model tensors are created under inference mode)
     with torch.inference_mode():
-        logits, acts = model.forward(toks, cache_activations_at=[layer_name])
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            logits, acts = model.forward(toks, cache_activations_at=[layer_name])
 
-        # Encode through SAE (move acts to SAE device — layer 26 may be on a different GPU)
-        sae_device = next(iter(sae.parameters())).device
-        features = sae.encode(acts[layer_name][0].to(sae_device))
+            # Encode through SAE (move acts to SAE device — layer 26 may be on a different GPU)
+            sae_device = next(iter(sae.parameters())).device
+            features = sae.encode(acts[layer_name][0].to(sae_device))
 
     return features.cpu().detach().float().numpy()
 
