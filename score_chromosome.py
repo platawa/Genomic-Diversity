@@ -110,7 +110,7 @@ def _find_non_n_runs(sequence: str) -> List[Tuple[int, int]]:
 # Import Evo2 model
 from evo2 import Evo2
 
-from results_utils import build_run_dir, write_completed
+from results_utils import build_run_dir, write_completed, find_latest_completed
 from detection_methods import (
     detect_drops_zscore, detect_drops_mad,
     detect_rises_zscore, detect_rises_mad,
@@ -193,6 +193,281 @@ ZSCORE_THRESHOLD = 2.5
 MAD_THRESHOLD = 3.0
 MIN_SEPARATION = 75
 BATCH_SIZE = 4  # Number of chunks to batch into a single forward pass
+
+
+# =============================================================================
+# SAE STATS COLLECTOR (fused with scoring forward passes)
+# =============================================================================
+
+class SAEStatsCollector:
+    """Collect SAE feature statistics during scoring forward passes.
+
+    Registers a non-aborting hook on layer 26 to capture activations,
+    immediately runs SAE encode, and accumulates per-feature min/max/mean/std.
+    Zero extra forward passes — just ~7ms SAE encode overhead per chunk.
+
+    Output is identical in format to scan_sae_global_stats.py, enabling
+    cross-validation between standalone and fused approaches.
+    """
+
+    N_FEATURES = 32768
+    SAE_ENCODE_BATCH = 4096  # Sub-batch SAE encode to limit GPU memory
+
+    def __init__(self, model, device):
+        """Load SAE, register non-aborting hook on blocks-26, init accumulators.
+
+        Args:
+            model: Evo2 model instance (plain Evo2, not ObservableEvo2).
+            device: CUDA device string (e.g. 'cuda:0').
+        """
+        from sae_utils import load_topk_sae_from_hf, SAE_LAYER_NAME
+
+        self.device = device
+        self.n_processed = 0
+        self._hook_handle = None
+
+        # Load SAE weights (~256 MB)
+        self.sae = load_topk_sae_from_hf(4096, device, torch.bfloat16)
+        self._sae_device = next(iter(self.sae.parameters())).device
+
+        # Try to compile SAE encoder for speed
+        try:
+            self.sae.encode = torch.compile(self.sae.encode)
+        except Exception:
+            pass
+
+        # Welford accumulators (same as scan_sae_global_stats.py)
+        self.global_min = np.full(self.N_FEATURES, np.inf, dtype=np.float64)
+        self.global_max = np.full(self.N_FEATURES, -np.inf, dtype=np.float64)
+        self.running_mean = np.zeros(self.N_FEATURES, dtype=np.float64)
+        self.running_m2 = np.zeros(self.N_FEATURES, dtype=np.float64)
+        self.n_nonzero_chunks = np.zeros(self.N_FEATURES, dtype=np.int64)
+
+        # Register non-aborting hook on blocks-26
+        target = self._find_module(model, SAE_LAYER_NAME)
+        self._hook_handle = target.register_forward_hook(self._hook_fn)
+
+    @staticmethod
+    def _find_module(evo2_model, module_path):
+        """Find module by ModelScope-style path (e.g. 'blocks-26')."""
+        inner = evo2_model.model if hasattr(evo2_model, 'model') else evo2_model
+        module_dict = {}
+
+        def recurse(module, prefix=''):
+            for name, child in module.named_children():
+                key = prefix + name
+                module_dict[key] = child
+                recurse(child, prefix=key + '-')
+
+        recurse(inner)
+        if module_path not in module_dict:
+            available = [k for k in module_dict if 'block' in k.lower()][:10]
+            raise KeyError(
+                f"Module '{module_path}' not found. Block-like modules: {available}")
+        return module_dict[module_path]
+
+    def _hook_fn(self, module, input, output):
+        """Non-aborting hook: capture layer-26 activations, encode through SAE,
+        and update running stats. Adds ~7ms per forward pass. Does NOT abort
+        the forward pass (unlike scan_sae_global_stats.py's early-exit hook)."""
+        acts = output[0] if isinstance(output, tuple) else output
+        acts = acts.detach()
+
+        with torch.inference_mode():
+            n_seqs = acts.shape[0] if acts.ndim == 3 else 1
+            for j in range(n_seqs):
+                act_j = acts[j] if acts.ndim == 3 else acts
+                seq_len = act_j.shape[0]
+
+                # Sub-batch SAE encode to limit peak GPU memory (~256 MB vs ~1 GB)
+                chunk_min_t = torch.full((self.N_FEATURES,), float('inf'),
+                                         device=act_j.device, dtype=torch.float32)
+                chunk_max_t = torch.full((self.N_FEATURES,), float('-inf'),
+                                         device=act_j.device, dtype=torch.float32)
+
+                for s in range(0, seq_len, self.SAE_ENCODE_BATCH):
+                    e = min(s + self.SAE_ENCODE_BATCH, seq_len)
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        features = self.sae.encode(act_j[s:e].to(self._sae_device))
+                    f_max = features.max(dim=0).values.float()
+                    f_min = features.min(dim=0).values.float()
+                    torch.minimum(chunk_min_t, f_min, out=chunk_min_t)
+                    torch.maximum(chunk_max_t, f_max, out=chunk_max_t)
+
+                chunk_min = chunk_min_t.cpu().numpy().astype(np.float64)
+                chunk_max = chunk_max_t.cpu().numpy().astype(np.float64)
+                self._update_stats(chunk_min, chunk_max)
+
+    def _update_stats(self, chunk_min, chunk_max):
+        """Update running min/max and Welford mean/variance accumulators."""
+        np.minimum(self.global_min, chunk_min, out=self.global_min)
+        np.maximum(self.global_max, chunk_max, out=self.global_max)
+
+        self.n_processed += 1
+        delta = chunk_max - self.running_mean
+        self.running_mean += delta / self.n_processed
+        delta2 = chunk_max - self.running_mean
+        self.running_m2 += delta * delta2
+        self.n_nonzero_chunks += (chunk_max > 0).astype(np.int64)
+
+    def remove_hook(self):
+        """Remove the forward hook."""
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+            self._hook_handle = None
+
+    def finalize(self):
+        """Return final stats dict in same format as scan_sae_global_stats.py."""
+        if self.n_processed > 1:
+            running_var = self.running_m2 / (self.n_processed - 1)
+        else:
+            running_var = np.zeros(self.N_FEATURES, dtype=np.float64)
+
+        gmin = self.global_min.copy()
+        gmax = self.global_max.copy()
+        gmin[gmin == np.inf] = 0.0
+        gmax[gmax == -np.inf] = 0.0
+
+        return {
+            "global_min": gmin.astype(np.float32),
+            "global_max": gmax.astype(np.float32),
+            "chunk_max_mean": self.running_mean.astype(np.float32),
+            "chunk_max_std": np.sqrt(running_var).astype(np.float32),
+            "n_nonzero_chunks": self.n_nonzero_chunks.copy(),
+            "n_chunks": self.n_processed,
+        }
+
+    def save_partial(self, path):
+        """Save raw Welford accumulators to .npz for multi-GPU merging."""
+        np.savez_compressed(path,
+                            global_min=self.global_min,
+                            global_max=self.global_max,
+                            running_mean=self.running_mean,
+                            running_m2=self.running_m2,
+                            n_nonzero_chunks=self.n_nonzero_chunks,
+                            n_processed=np.array(self.n_processed))
+
+    def save(self, results_dir, chrom, genome_length, chunk_size, overlap,
+             wall_time_s=0):
+        """Save final stats to results/{chrom}/sae_global_stats/ directory."""
+        stats = self.finalize()
+        return SAEStatsCollector.save_stats(
+            stats, results_dir, chrom, genome_length, chunk_size, overlap,
+            wall_time_s=wall_time_s, method="fused_scoring")
+
+    @staticmethod
+    def merge_partial_files(stats_dir):
+        """Read and merge partial stats .npz files from multi-GPU workers."""
+        import glob as _glob
+        partial_files = sorted(
+            _glob.glob(os.path.join(stats_dir, "sae_partial_gpu*.npz")))
+        if not partial_files:
+            return None
+
+        partials = []
+        for f in partial_files:
+            data = np.load(f)
+            partials.append({
+                "global_min": data["global_min"].astype(np.float64),
+                "global_max": data["global_max"].astype(np.float64),
+                "running_mean": data["running_mean"].astype(np.float64),
+                "running_m2": data["running_m2"].astype(np.float64),
+                "n_nonzero_chunks": data["n_nonzero_chunks"],
+                "n_processed": int(data["n_processed"]),
+            })
+
+        return SAEStatsCollector._merge_partials(partials)
+
+    @staticmethod
+    def _merge_partials(partials):
+        """Merge partial stats using parallel Welford algorithm."""
+        N = SAEStatsCollector.N_FEATURES
+        merged_min = np.full(N, np.inf, dtype=np.float64)
+        merged_max = np.full(N, -np.inf, dtype=np.float64)
+        merged_mean = np.zeros(N, dtype=np.float64)
+        merged_m2 = np.zeros(N, dtype=np.float64)
+        merged_nonzero = np.zeros(N, dtype=np.int64)
+        total_n = 0
+
+        for p in partials:
+            n_b = p["n_processed"]
+            if n_b == 0:
+                continue
+
+            np.minimum(merged_min, p["global_min"], out=merged_min)
+            np.maximum(merged_max, p["global_max"], out=merged_max)
+            merged_nonzero += p["n_nonzero_chunks"]
+
+            # Parallel Welford merge
+            n_a = total_n
+            n_combined = n_a + n_b
+            delta = p["running_mean"] - merged_mean
+            if n_a == 0:
+                merged_mean = p["running_mean"].copy()
+                merged_m2 = p["running_m2"].copy()
+            else:
+                merged_mean += delta * n_b / n_combined
+                merged_m2 += (p["running_m2"]
+                              + delta * delta * n_a * n_b / n_combined)
+            total_n = n_combined
+
+        merged_min[merged_min == np.inf] = 0.0
+        merged_max[merged_max == -np.inf] = 0.0
+
+        if total_n > 1:
+            running_var = merged_m2 / (total_n - 1)
+        else:
+            running_var = np.zeros(N, dtype=np.float64)
+
+        return {
+            "global_min": merged_min.astype(np.float32),
+            "global_max": merged_max.astype(np.float32),
+            "chunk_max_mean": merged_mean.astype(np.float32),
+            "chunk_max_std": np.sqrt(running_var).astype(np.float32),
+            "n_nonzero_chunks": merged_nonzero,
+            "n_chunks": total_n,
+        }
+
+    @staticmethod
+    def save_stats(stats, results_dir, chrom, genome_length, chunk_size,
+                   overlap, wall_time_s=0, method="fused_scoring"):
+        """Save a stats dict to results/{chrom}/sae_global_stats/."""
+        run_dir = build_run_dir(results_dir, chrom, "sae_global_stats",
+                                "fused_minmax")
+        data_dir = os.path.join(run_dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+
+        np.savez_compressed(
+            os.path.join(data_dir, "global_sae_stats.npz"),
+            global_min=stats["global_min"],
+            global_max=stats["global_max"],
+            chunk_max_mean=stats["chunk_max_mean"],
+            chunk_max_std=stats["chunk_max_std"],
+            n_nonzero_chunks=stats["n_nonzero_chunks"],
+            n_chunks=np.array(stats["n_chunks"]),
+            genome_length=np.array(genome_length),
+        )
+
+        n_active = int(np.sum(stats["global_max"] > 0))
+        summary = {
+            "chrom": chrom,
+            "genome_length": genome_length,
+            "n_chunks": stats["n_chunks"],
+            "chunk_size": chunk_size,
+            "overlap": overlap,
+            "n_features": SAEStatsCollector.N_FEATURES,
+            "n_active_features": n_active,
+            "global_max_range": [float(stats["global_max"].min()),
+                                 float(stats["global_max"].max())],
+            "method": method,
+        }
+        with open(os.path.join(data_dir, "scan_summary.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+            f.write("\n")
+
+        write_completed(run_dir, "score_chromosome.py (fused SAE stats)",
+                        wall_time_s)
+        return run_dir
 
 
 # =============================================================================
@@ -991,6 +1266,8 @@ def _chromosome_gpu_worker(
     use_torch_compile: bool = False,
     batch_size: int = 1,
     use_bf16: bool = False,
+    collect_sae_stats: bool = False,
+    sae_stats_dir: str = None,
 ):
     """
     Worker process that loads a model on a specific GPU and scores assigned chunks.
@@ -1012,6 +1289,8 @@ def _chromosome_gpu_worker(
         ll_next_shm_name: Shared memory name for LL_next [L] float32
         stitch_method: Overlap handling ("core", "mean", "min")
         result_shm_alt_name: Alternate shared memory for even/odd layer separation
+        collect_sae_stats: If True, hook layer 26 and collect SAE feature stats
+        sae_stats_dir: Directory to write partial SAE stats for merging
     """
     import os
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -1076,9 +1355,16 @@ def _chromosome_gpu_worker(
         acgt_ids.append(toks_list[0])
     ACGT_IDS = _torch.tensor(acgt_ids, dtype=_torch.long, device=device)
 
+    # SAE stats collection (hook auto-fires during forward passes)
+    sae_collector = None
+    if collect_sae_stats:
+        sae_collector = SAEStatsCollector(model, device)
+        print(f"[GPU {gpu_id}] SAE stats collection enabled (hook on blocks-26)")
+
     rc_label = " (RC-averaged)" if reverse_complement else ""
     lp_label = " +logprobs" if compute_logprobs else ""
-    print(f"[GPU {gpu_id}] Model loaded. Processing {len(work_items)} chunks{rc_label}{lp_label}...")
+    sae_label = " +sae_stats" if collect_sae_stats else ""
+    print(f"[GPU {gpu_id}] Model loaded. Processing {len(work_items)} chunks{rc_label}{lp_label}{sae_label}...")
 
     non_acgt_re = _re.compile(r'[^ACGT]')
     bases = ['A', 'C', 'G', 'T']
@@ -1474,6 +1760,17 @@ def _chromosome_gpu_worker(
     print(f"[GPU {gpu_id}] Done: {n_scored:,} positions scored, "
           f"{n_skipped} skipped, {elapsed:.1f}s total")
 
+    # Save partial SAE stats for multi-GPU merging
+    if sae_collector is not None:
+        sae_collector.remove_hook()
+        if sae_stats_dir:
+            import os as _os2
+            partial_path = _os2.path.join(sae_stats_dir,
+                                          f"sae_partial_gpu{gpu_id}.npz")
+            sae_collector.save_partial(partial_path)
+            print(f"[GPU {gpu_id}] SAE partial stats saved "
+                  f"({sae_collector.n_processed} chunks)")
+
     # Close shared memory handles (don't unlink — main process does that)
     seq_shm.close()
     result_shm.close()
@@ -1497,6 +1794,8 @@ def score_chromosome_region_multigpu(
     stitch_method: str = "core",
     use_torch_compile: bool = False,
     batch_size: int = BATCH_SIZE,
+    collect_sae_stats: bool = False,
+    sae_stats_dir: str = None,
     use_bf16: bool = False,
 ) -> Union[np.ndarray, dict]:
     """
@@ -1619,6 +1918,15 @@ def score_chromosome_region_multigpu(
     if logger:
         logger.info(f"  Shared memory: {shm_total/1e6:.1f}MB total")
 
+    # SAE stats temp directory for multi-GPU partials
+    _sae_tmp_dir = None
+    if collect_sae_stats:
+        import tempfile
+        _sae_tmp_dir = sae_stats_dir or tempfile.mkdtemp(prefix="sae_stats_")
+        os.makedirs(_sae_tmp_dir, exist_ok=True)
+        if logger:
+            logger.info(f"  SAE stats collection enabled (partials in {_sae_tmp_dir})")
+
     # Spawn workers
     processes = []
     active_gpu_ids = []
@@ -1636,7 +1944,9 @@ def score_chromosome_region_multigpu(
                   result_shm_alt.name if result_shm_alt else None,
                   use_torch_compile,
                   batch_size,
-                  use_bf16),
+                  use_bf16,
+                  collect_sae_stats,
+                  _sae_tmp_dir),
         )
         processes.append(p)
         active_gpu_ids.append(gid)
@@ -1664,6 +1974,18 @@ def score_chromosome_region_multigpu(
         if p.exitcode != 0:
             if logger:
                 logger.warning(f"  Worker {i} exited with code {p.exitcode}")
+
+    # Merge SAE partial stats from workers
+    if collect_sae_stats and _sae_tmp_dir:
+        merged_sae = SAEStatsCollector.merge_partial_files(_sae_tmp_dir)
+        if merged_sae is not None:
+            merged_path = os.path.join(_sae_tmp_dir, "merged_sae_stats.npz")
+            np.savez_compressed(merged_path, **merged_sae)
+            if logger:
+                n_active = int(np.sum(merged_sae["global_max"] > 0))
+                logger.info(f"  SAE stats merged from {len(active_gpu_ids)} workers: "
+                            f"{merged_sae['n_chunks']} chunks, "
+                            f"{n_active} active features")
 
     # Copy results from shared memory and combine layers for stitch methods
     if stitch_method == "mean" and entropy_alt_shared is not None:
@@ -2290,6 +2612,14 @@ Examples:
                              "Warning: ~2-3GB for 50M positions. "
                              "Requires --compute_logprobs.")
 
+    # SAE stats collection (fused with scoring — ~7ms overhead per chunk)
+    parser.add_argument("--collect_sae_stats", action="store_true", default=False,
+                        help="Collect SAE global feature statistics during scoring. "
+                             "Hooks layer 26 activations and runs SAE encode "
+                             "(~7ms overhead per chunk, ~256MB extra GPU memory). "
+                             "Saves to results/{chrom}/sae_global_stats/. "
+                             "Replaces the need for a separate scan_sae_global_stats.py run.")
+
     # Performance options
     parser.add_argument("--torch_compile", action="store_true", default=False,
                         help="Apply torch.compile to the model for fused kernels. "
@@ -2307,6 +2637,11 @@ Examples:
                              "for numerical stability.")
     parser.add_argument("--no_bf16", action="store_true", default=False,
                         help="Disable bfloat16 autocast (use full float32).")
+
+    # Skip-completed safety net
+    parser.add_argument("--skip_if_completed", action="store_true", default=False,
+                        help="Exit early if a COMPLETED scoring run already exists "
+                             "for this chromosome. Checked before model loading.")
 
     # Other options
     parser.add_argument("--log_level", type=str, default="INFO",
@@ -2331,6 +2666,8 @@ Examples:
         flags.append("bf16")
     if args.batch_size > 1:
         flags.append(f"batch{args.batch_size}")
+    if args.collect_sae_stats:
+        flags.append("saestats")
     gpu_label = f"{args.n_gpus}gpu" if args.n_gpus > 0 else "autogpu"
     flags.append(gpu_label)
     flags_str = "_".join(flags)
@@ -2346,6 +2683,14 @@ Examples:
     logger.info("CHROMOSOME SCORING AND DROP BOUNDARY DETECTION")
     logger.info("=" * 70)
     logger.info(f"Log file: {log_file}")
+
+    # Skip if a completed run already exists (before any heavy loading)
+    if args.skip_if_completed:
+        existing = find_latest_completed(args.output_dir, args.chrom, "scoring")
+        if existing:
+            logger.info(f"SKIP: Completed scoring run already exists: {existing}")
+            print(f"SKIP: Completed scoring run already exists: {existing}")
+            sys.exit(0)
 
     # Record run metadata
     run_metadata = {
@@ -2371,6 +2716,7 @@ Examples:
             "stitch_method": args.stitch_method,
             "batch_size": args.batch_size,
             "bf16": args.bf16,
+            "collect_sae_stats": args.collect_sae_stats,
         }
     }
 
@@ -2491,6 +2837,12 @@ Examples:
 
         ACGT_IDS = get_acgt_token_ids(model, device)
 
+        # SAE stats collection (single-GPU: hook on this model)
+        sae_collector = None
+        if args.collect_sae_stats:
+            sae_collector = SAEStatsCollector(model, device)
+            logger.info("  SAE stats collection enabled (fused with scoring)")
+
         # Auto-probe on single GPU (model is already on 1 GPU)
         if args.auto_chunk_size:
             logger.info("-" * 70)
@@ -2519,7 +2871,13 @@ Examples:
 
     step3_start = time.time()
     logprobs_data = None
+    sae_stats_dir = None
     if n_gpus > 1:
+        # Multi-GPU: create temp dir for SAE partial stats
+        if args.collect_sae_stats:
+            import tempfile
+            sae_stats_dir = tempfile.mkdtemp(prefix="sae_stats_")
+
         logger.info(f"Using MULTI-GPU scoring ({n_gpus} GPUs, "
                      f"chunk_size={args.max_chunk_len:,} bp)...")
         scoring_result = score_chromosome_region_multigpu(
@@ -2535,6 +2893,8 @@ Examples:
             use_torch_compile=args.torch_compile,
             batch_size=args.batch_size,
             use_bf16=args.bf16,
+            collect_sae_stats=args.collect_sae_stats,
+            sae_stats_dir=sae_stats_dir,
         )
     else:
         scoring_result = score_chromosome_region(
@@ -2565,6 +2925,38 @@ Examples:
     logger.info(f"  NaN fraction: {np.isnan(entropy).sum() / len(entropy):.4%}")
     logger.info(f"  STEP 3 completed in {step3_time:.2f}s "
                 f"({n_scored / step3_time:.0f} positions/s)")
+
+    # Save SAE global stats (if collected during scoring)
+    if args.collect_sae_stats:
+        logger.info("-" * 70)
+        logger.info("STEP 3b: Saving fused SAE global stats")
+        logger.info("-" * 70)
+        sae_wall = time.time() - wall_start
+        if n_gpus <= 1 and sae_collector is not None:
+            sae_collector.remove_hook()
+            sae_run_dir = sae_collector.save(
+                args.output_dir, args.chrom, len(sequence),
+                args.max_chunk_len, args.chunk_overlap,
+                wall_time_s=sae_wall)
+            stats = sae_collector.finalize()
+            n_active = int(np.sum(stats["global_max"] > 0))
+            logger.info(f"  SAE stats: {stats['n_chunks']} chunks, "
+                        f"{n_active}/{SAEStatsCollector.N_FEATURES} active features")
+            logger.info(f"  Output: {sae_run_dir}")
+        elif n_gpus > 1 and sae_stats_dir:
+            merged = SAEStatsCollector.merge_partial_files(sae_stats_dir)
+            if merged:
+                sae_run_dir = SAEStatsCollector.save_stats(
+                    merged, args.output_dir, args.chrom, len(sequence),
+                    args.max_chunk_len, args.chunk_overlap,
+                    wall_time_s=sae_wall, method="fused_scoring_multigpu")
+                n_active = int(np.sum(merged["global_max"] > 0))
+                logger.info(f"  SAE stats: {merged['n_chunks']} chunks, "
+                            f"{n_active}/{SAEStatsCollector.N_FEATURES} active features")
+                logger.info(f"  Output: {sae_run_dir}")
+            # Clean up temp partial files
+            import shutil
+            shutil.rmtree(sae_stats_dir, ignore_errors=True)
 
     # Run detection
     logger.info("-" * 70)

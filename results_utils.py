@@ -89,3 +89,22 @@ def find_latest_completed(base_dir, chrom, stage):
     # Sort lexicographically — YYYYMMDD_HHMMSS prefix ensures chronological order
     completed_runs.sort()
     return os.path.join(stage_dir, completed_runs[-1])
+
+
+def find_all_completed(base_dir, chroms, stage):
+    """Find completed runs for multiple chromosomes.
+
+    Args:
+        base_dir: Root results directory (e.g. "./results").
+        chroms: List of chromosome names to check.
+        stage: Pipeline stage ("scoring", "sae_global_stats", etc.).
+
+    Returns:
+        dict of {chrom: run_dir} for all chroms with a completed run.
+    """
+    result = {}
+    for chrom in chroms:
+        run_dir = find_latest_completed(base_dir, chrom, stage)
+        if run_dir is not None:
+            result[chrom] = run_dir
+    return result
