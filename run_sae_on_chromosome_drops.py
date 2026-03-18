@@ -760,6 +760,7 @@ def plot_region_features(
     entropy: Optional[np.ndarray] = None,
     gtf_features: Optional[List] = None,
     n_plot_features: int = DEFAULT_N_PLOT_FEATURES,
+    feature_stats: Optional[Dict[str, np.ndarray]] = None,
 ):
     """
     Plot SAE features for a region — Figure 4C style with gene track.
@@ -827,7 +828,10 @@ def plot_region_features(
 
     for ind, feature_id in enumerate(selected_features):
         ax = axes[ind]
-        ax.plot(x, feature_ts[:, feature_id], lw=0.5, color='black', alpha=0.9)
+        trace = feature_ts[:, feature_id]
+        if feature_stats is not None:
+            trace = (trace - feature_stats['mean'][feature_id]) / feature_stats['std'][feature_id]
+        ax.plot(x, trace, lw=0.5, color='black', alpha=0.9)
 
         # Overlay GenBank annotations (same as notebook)
         if annotations:
@@ -851,8 +855,14 @@ def plot_region_features(
         ax.axvline(rise_x, color='blue', linestyle='--', lw=0.8, alpha=0.7)
 
         ax.set_xlim(padded_start, padded_end)
-        ax.set_ylim([0, 7])
-        ax.set_yticks([0, 5])
+        if feature_stats is not None:
+            ymax = max(np.percentile(np.abs(trace), 99) if len(trace) > 0 else 3.0, 2.0)
+            ax.set_ylim([-ymax, ymax])
+            ax.set_yticks([-2, 0, 2])
+            ax.axhline(0, color='#aaaaaa', lw=0.4, zorder=0)
+        else:
+            ax.set_ylim([0, 7])
+            ax.set_yticks([0, 5])
         ax.set_ylabel(f"F{feature_id}", fontsize=8, rotation=0, labelpad=30, va='center')
         ax.tick_params(axis='y', labelsize=7)
         ax.spines['top'].set_visible(False)
@@ -974,6 +984,7 @@ def plot_region_figure4g(
     gtf_features: Optional[List] = None,
     n_plot_features: int = DEFAULT_N_PLOT_FEATURES,
     chrom: str = "",
+    feature_stats: Optional[Dict[str, np.ndarray]] = None,
 ):
     """
     Figure 4g-style plot: filled area SAE feature traces + annotation track.
@@ -1055,11 +1066,18 @@ def plot_region_figure4g(
         ax = axes[ind]
         trace = feature_ts[:, feature_id]
 
+        # Z-score normalize using chromosome-level stats if provided
+        if feature_stats is not None:
+            trace = (trace - feature_stats['mean'][feature_id]) / feature_stats['std'][feature_id]
+            normalized = True
+        else:
+            normalized = False
+
         # Gray exon/CDS shading behind traces (like Fig 4g)
         for s, e in exon_regions:
             ax.axvspan(s, e, alpha=0.12, facecolor='#888888', edgecolor='none', zorder=0)
 
-        # Filled area plot (Figure 4g style)
+        # Filled area plot (Figure 4g style) — baseline 0 for both raw and z-scored
         ax.fill_between(x, 0, trace, facecolor=fill_color, alpha=fill_alpha,
                          edgecolor=line_color, linewidth=line_width)
 
@@ -1067,10 +1085,17 @@ def plot_region_figure4g(
         ax.axvline(drop_x, color='#D62828', linestyle='--', lw=0.7, alpha=0.5)
         ax.axvline(rise_x, color='#1D3557', linestyle='--', lw=0.7, alpha=0.5)
 
-        ymax = max(np.percentile(trace[trace > 0], 99) if np.any(trace > 0) else 3, 3)
-        ax.set_xlim(padded_start, padded_end)
-        ax.set_ylim([0, ymax])
-        ax.set_yticks([0, int(ymax)])
+        if normalized:
+            ymax = max(np.percentile(np.abs(trace), 99) if len(trace) > 0 else 3.0, 2.0)
+            ax.set_xlim(padded_start, padded_end)
+            ax.set_ylim([-ymax, ymax])
+            ax.set_yticks([-2, 0, 2])
+            ax.axhline(0, color='#aaaaaa', lw=0.4, zorder=0)
+        else:
+            ymax = max(np.percentile(trace[trace > 0], 99) if np.any(trace > 0) else 3, 3)
+            ax.set_xlim(padded_start, padded_end)
+            ax.set_ylim([0, ymax])
+            ax.set_yticks([0, int(ymax)])
 
         # Label: orange for known bio features, gray for region-specific
         is_bio = feature_id in KNOWN_BIO_FEATURES
@@ -1088,7 +1113,8 @@ def plot_region_figure4g(
         # "Feature activations" label on the right of middle panel
         if ind == n_features // 2:
             ax2 = ax.twinx()
-            ax2.set_ylabel("Feature activations", fontsize=10, rotation=270,
+            ylabel = "Feature activations (z-scored)" if feature_stats is not None else "Feature activations"
+            ax2.set_ylabel(ylabel, fontsize=10, rotation=270,
                            labelpad=15, color='#555555')
             ax2.set_yticks([])
 
@@ -2028,6 +2054,28 @@ Examples:
     )
 
     # -------------------------------------------------------------------------
+    # STEP 6b: Compute per-feature z-score normalization stats
+    # -------------------------------------------------------------------------
+    # Use all processed regions as the normalization reference (chromosome-level proxy).
+    # For each of the 32,768 SAE features: mean and std across all positions in all regions.
+    logger.info("-" * 70)
+    logger.info("STEP 6b: Computing per-feature normalization stats across all regions")
+    logger.info("-" * 70)
+
+    all_acts = np.concatenate([r['feature_ts'] for r in results], axis=0)  # (total_pos, 32768)
+    feature_mean = all_acts.mean(axis=0)
+    feature_std = np.maximum(all_acts.std(axis=0), 1e-6)
+    feature_stats = {'mean': feature_mean, 'std': feature_std}
+    logger.info(f"  Normalization stats computed from {all_acts.shape[0]:,} positions "
+                f"across {len(results)} regions")
+    del all_acts  # free memory
+
+    # Save stats to disk for reuse
+    stats_path = os.path.join(args.output_dir, 'data', 'feature_norm_stats.npz')
+    np.savez_compressed(stats_path, mean=feature_mean, std=feature_std)
+    logger.info(f"  Saved normalization stats to {stats_path}")
+
+    # -------------------------------------------------------------------------
     # STEP 7: Find signature features
     # -------------------------------------------------------------------------
     logger.info("-" * 70)
@@ -2103,6 +2151,7 @@ Examples:
                 entropy=entropy, gtf_features=region_gtf,
                 n_plot_features=args.n_plot_features,
                 chrom=args.chrom,
+                feature_stats=feature_stats,
             )
 
             # Standalone entropy curve (kept for quick viewing)
