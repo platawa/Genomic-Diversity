@@ -145,21 +145,13 @@ is_large_chrom() {
 
 
 get_scoring_partition() {
-    local chrom="$1"
-    if is_large_chrom "$chrom"; then
-        echo "$GPU_PARTITION_LARGE"
-    else
-        echo "$GPU_PARTITION_SMALL"
-    fi
+    # All scoring jobs use mit_preemptable: only partition supporting 4x H200,
+    # and ensures jobs run in submission order (smallest-first per ALL_CHROMS)
+    echo "$GPU_PARTITION_LARGE"
 }
 
 get_scoring_time() {
-    local chrom="$1"
-    if is_large_chrom "$chrom"; then
-        echo "48:00:00"
-    else
-        echo "06:00:00"
-    fi
+    echo "48:00:00"
 }
 
 get_scoring_gpus() {
