@@ -81,6 +81,7 @@ SKIP_ANALYSIS=false
 RC_AVERAGE=true
 COMPUTE_LOGPROBS=true
 FORCE=false
+FORCE_SAE_STATS=false
 CHROMS=()
 
 usage() {
@@ -96,6 +97,7 @@ usage() {
     echo "  --no-rc            Disable RC averaging (halves scoring time)"
     echo "  --no-logprobs      Don't compute logprobs (11x smaller entropy files)"
     echo "  --force            Rerun scoring even if COMPLETED sentinel exists"
+    echo "  --force-sae-stats  Recollect SAE stats even if already completed"
     echo ""
     echo "Examples:"
     echo "  $0 all --dry-run"
@@ -117,6 +119,7 @@ while [[ $# -gt 0 ]]; do
         --no-rc)           RC_AVERAGE=false; shift ;;
         --no-logprobs)     COMPUTE_LOGPROBS=false; shift ;;
         --force)           FORCE=true; shift ;;
+        --force-sae-stats) FORCE_SAE_STATS=true; shift ;;
         --help|-h)         usage ;;
         all)               CHROMS=("${ALL_CHROMS[@]}"); shift ;;
         chr*|NC_*)         CHROMS+=("$1"); shift ;;
@@ -225,9 +228,9 @@ for chrom in "${CHROMS[@]}"; do
             n_gpus=$(get_scoring_gpus "$chrom")
             score_mem=$(get_scoring_mem "$chrom")
 
-            # Smart SAE stats: collect if no existing sae_global_stats
+            # Smart SAE stats: collect if no existing sae_global_stats, or if --force-sae-stats
             sae_flag=""
-            if has_completed "$chrom" "sae_global_stats"; then
+            if ! $FORCE_SAE_STATS && has_completed "$chrom" "sae_global_stats"; then
                 echo "  SAE stats: already completed (scoring only)"
             else
                 sae_flag="--collect_sae_stats"
