@@ -246,7 +246,7 @@ for chrom in "${CHROMS[@]}"; do
 #!/bin/bash
 #SBATCH -J score_${chrom}
 #SBATCH -p ${partition}
-#SBATCH --gres=gpu:h100:4
+#SBATCH --gres=gpu:h200:4
 #SBATCH --cpus-per-task=${SCORE_CPUS}
 #SBATCH --mem=${score_mem}
 #SBATCH -t ${time_limit}
