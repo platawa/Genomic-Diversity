@@ -290,7 +290,7 @@ SBATCH
 #!/bin/bash
 #SBATCH -J sae_drops_${chrom}
 #SBATCH -p ${GPU_PARTITION_LARGE}
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:h200:1
 #SBATCH --cpus-per-task=${SAE_CPUS}
 #SBATCH --mem=${SAE_MEM}
 #SBATCH -t ${SAE_TIME}
