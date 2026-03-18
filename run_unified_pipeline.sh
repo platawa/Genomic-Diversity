@@ -44,7 +44,7 @@ GTF="/orcd/data/zhang_f/001/platawa/data/MEng_Thesis/ncbi_dataset_all_2/ncbi_dat
 
 # Scoring defaults
 SCORE_GPUS=0            # 0 = autogpu (torch.cuda.device_count()); requires --gres=gpu:h200:4
-SCORE_CPUS=8
+SCORE_CPUS=4            # 4 GPU workers; GPU-bound so main process shares fine
 SCORE_MEM="100G"
 
 # SAE drop analysis defaults
@@ -74,14 +74,13 @@ LARGE_CHROMS="chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chrX"
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 DRY_RUN=false
-SCORING_ONLY=true   # default: scoring only; use --all-stages to also submit SAE drops + analysis
+SCORING_ONLY=false  # default: scoring + SAE drops; use --scoring-only to skip downstream
 SKIP_SCORING=false
 SKIP_SAE_DROPS=false
 SKIP_ANALYSIS=false
 RC_AVERAGE=true
 COMPUTE_LOGPROBS=true
 FORCE=false
-FORCE_SAE_STATS=false
 CHROMS=()
 
 usage() {
@@ -89,15 +88,13 @@ usage() {
     echo ""
     echo "Options:"
     echo "  --dry-run          Preview commands without submitting"
-    echo "  --all-stages       Also submit SAE drops + analysis (default: scoring only)"
-    echo "  --scoring-only     Only run scoring — same as default, kept for clarity"
+    echo "  --scoring-only     Only run scoring; skip SAE drops + analysis"
     echo "  --skip-scoring     Skip scoring (assumes already done)"
     echo "  --skip-sae-drops   Skip SAE drop analysis"
     echo "  --skip-analysis    Skip CPU analysis/plotting"
     echo "  --no-rc            Disable RC averaging (halves scoring time)"
     echo "  --no-logprobs      Don't compute logprobs (11x smaller entropy files)"
     echo "  --force            Rerun scoring even if COMPLETED sentinel exists"
-    echo "  --force-sae-stats  Recollect SAE stats even if already completed"
     echo ""
     echo "Examples:"
     echo "  $0 all --dry-run"
@@ -111,7 +108,6 @@ if [[ $# -eq 0 ]]; then usage; fi
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)         DRY_RUN=true; shift ;;
-        --all-stages)      SCORING_ONLY=false; shift ;;
         --scoring-only)    SCORING_ONLY=true; shift ;;
         --skip-scoring)    SKIP_SCORING=true; shift ;;
         --skip-sae-drops)  SKIP_SAE_DROPS=true; shift ;;
@@ -119,7 +115,6 @@ while [[ $# -gt 0 ]]; do
         --no-rc)           RC_AVERAGE=false; shift ;;
         --no-logprobs)     COMPUTE_LOGPROBS=false; shift ;;
         --force)           FORCE=true; shift ;;
-        --force-sae-stats) FORCE_SAE_STATS=true; shift ;;
         --help|-h)         usage ;;
         all)               CHROMS=("${ALL_CHROMS[@]}"); shift ;;
         chr*|NC_*)         CHROMS+=("$1"); shift ;;
@@ -228,16 +223,8 @@ for chrom in "${CHROMS[@]}"; do
             n_gpus=$(get_scoring_gpus "$chrom")
             score_mem=$(get_scoring_mem "$chrom")
 
-            # Smart SAE stats: collect if no existing sae_global_stats, or if --force-sae-stats
-            sae_flag=""
-            if ! $FORCE_SAE_STATS && has_completed "$chrom" "sae_global_stats"; then
-                echo "  SAE stats: already completed (scoring only)"
-            else
-                sae_flag="--collect_sae_stats"
-                echo "  SAE stats: will collect during scoring (fused)"
-            fi
-
-            # Build scoring flags
+            # Build scoring flags (no fused --collect_sae_stats: loading SAE alongside Evo2
+            # in each worker causes canUse32BitIndexMath OOM; SAE runs separately after scoring)
             score_flags=""
             if $RC_AVERAGE; then score_flags="$score_flags --rc_average"; fi
             if $COMPUTE_LOGPROBS; then score_flags="$score_flags --compute_logprobs"; fi
@@ -262,7 +249,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 echo "=== Scoring ${chrom} (partition=${partition}) ==="
 echo "Started: \$(date)"
 
-python score_chromosome.py --chrom ${chrom} --fasta ${FASTA} --output_dir ${RESULTS_DIR} --n_gpus ${n_gpus} --max_chunk_len 25000 --chunk_overlap 1024 --detection_methods zscore,mad ${score_flags} ${sae_flag}
+python score_chromosome.py --chrom ${chrom} --fasta ${FASTA} --output_dir ${RESULTS_DIR} --n_gpus ${n_gpus} --max_chunk_len 25000 --chunk_overlap 1024 --detection_methods zscore,mad ${score_flags}
 
 echo "Finished: \$(date)"
 SBATCH
