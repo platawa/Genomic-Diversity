@@ -104,11 +104,27 @@ def detect_stage(run_dir: str) -> str:
 # Stage: sae (run_sae_on_chromosome_drops.py)
 # ---------------------------------------------------------------------------
 
-def replot_sae(run_dir: str, output_dir: str, logger: logging.Logger):
-    """Replot SAE feature analysis from saved data."""
+def replot_sae(run_dir: str, output_dir: str, logger: logging.Logger,
+               normalize: str = 'zscore', n_plot_regions: int = 50,
+               n_plot_features: int = 8, entropy_path: str = None,
+               gtf_path: str = None, chrom: str = None):
+    """Replot SAE feature analysis from saved data.
+
+    Args:
+        normalize: Normalization for per-region feature plots.
+                   'zscore'  — z-score per feature across all regions (default)
+                   'minmax'  — scale each feature to [0, 1] across all regions
+                   'both'    — generate both zscore and minmax subdirectories
+                   'raw'     — no normalization (original behavior)
+        n_plot_regions: Number of top-confidence regions to plot (0 = all).
+        n_plot_features: Number of features to show per region plot.
+        entropy_path: Path to entropy .npz file for entropy panel overlay.
+        gtf_path: Path to GTF file for gene track panel.
+        chrom: Chromosome name (needed for GTF loading).
+    """
     from run_sae_on_chromosome_drops import (
         plot_signature_summary, plot_feature_heatmap,
-        plot_feature_prevalence_by_method,
+        plot_feature_prevalence_by_method, plot_region_figure4g,
     )
 
     data_dir = os.path.join(run_dir, 'data')
@@ -130,38 +146,171 @@ def replot_sae(run_dir: str, output_dir: str, logger: logging.Logger):
         })
     logger.info(f"Loaded {len(signatures)} signature features")
 
-    # Load SAE results for heatmap
+    # Load SAE results (region metadata + top features)
     results_path = os.path.join(data_dir, 'sae_results.tsv')
     sae_rows = load_tsv(results_path)
-    # Build minimal result dicts for heatmap (needs top_feature_idx per region)
-    # Group by region_idx
     from collections import defaultdict
-    region_features = defaultdict(list)
+    region_meta = {}  # ridx -> row
+    region_features_raw = defaultdict(list)
     for row in sae_rows:
         ridx = int(row.get('region_idx', row.get('region', 0)))
-        fid = int(row.get('feature_id', row.get('feature', 0)))
-        act = float(row.get('activation', row.get('mean_activation', 0)))
-        region_features[ridx].append((fid, act))
+        region_meta[ridx] = row
+        top_str = row.get('top_features', '')
+        if top_str:
+            region_features_raw[ridx] = [int(f) for f in top_str.split(',') if f.strip()]
 
     results = []
-    for ridx in sorted(region_features.keys()):
-        feats = region_features[ridx]
+    for ridx in sorted(region_meta.keys()):
+        row = region_meta[ridx]
         results.append({
-            'region': {'region_idx': ridx},
-            'top_feature_idx': [f[0] for f in sorted(feats, key=lambda x: -x[1])],
-            'drop_features': feats,
+            'region': {
+                'region_idx': ridx,
+                'genomic_start': int(row.get('genomic_start', 0)),
+                'genomic_end': int(row.get('genomic_end', 0)),
+                'method': row.get('method', 'unknown'),
+                'start_confidence': float(row.get('confidence', 0)),
+            },
+            'top_feature_idx': region_features_raw.get(ridx, []),
+            'drop_features': [],
         })
     logger.info(f"Loaded {len(results)} regions from SAE results")
 
-    # Plot
+    # Summary plots (no feature matrices needed)
     plot_signature_summary(signatures, os.path.join(output_dir, 'signature_summary.png'))
     logger.info("Plotted signature_summary.png")
-
     plot_feature_heatmap(results, signatures, os.path.join(output_dir, 'feature_heatmap.png'))
     logger.info("Plotted feature_heatmap.png")
-
     plot_feature_prevalence_by_method(signatures, os.path.join(output_dir, 'feature_prevalence_by_method.png'))
     logger.info("Plotted feature_prevalence_by_method.png")
+
+    # ── Per-region normalized feature plots ──────────────────────────────────
+    matrices_path = os.path.join(data_dir, 'feature_matrices.npz')
+    if not os.path.exists(matrices_path):
+        logger.warning(f"feature_matrices.npz not found at {matrices_path}, skipping per-region plots")
+        return
+
+    logger.info(f"Loading feature matrices from {matrices_path}")
+    mat_data = np.load(matrices_path)
+    n_regions = len(results)
+    feature_matrices = []
+    for i in range(n_regions):
+        key = f'region_{i}'
+        if key in mat_data:
+            feature_matrices.append(mat_data[key])
+        else:
+            feature_matrices.append(None)
+
+    # Compute normalization stats from ALL regions (chromosome-level proxy)
+    valid_mats = [m for m in feature_matrices if m is not None]
+    if not valid_mats:
+        logger.warning("No valid feature matrices found")
+        return
+
+    all_acts = np.concatenate(valid_mats, axis=0)  # (total_positions, 32768)
+    feat_mean = all_acts.mean(axis=0)
+    feat_std = np.maximum(all_acts.std(axis=0), 1e-6)
+    feat_min = all_acts.min(axis=0)
+    feat_max = all_acts.max(axis=0)
+    feat_span = np.maximum(feat_max - feat_min, 1e-6)
+    del all_acts
+    logger.info(f"Computed normalization stats from {len(valid_mats)} regions")
+
+    # Save stats
+    np.savez_compressed(os.path.join(data_dir, 'feature_norm_stats.npz'),
+                        mean=feat_mean, std=feat_std,
+                        min=feat_min, max=feat_max)
+    logger.info("Saved feature_norm_stats.npz")
+
+    # Optionally load entropy
+    entropy = None
+    if entropy_path and os.path.exists(entropy_path):
+        entropy = np.load(entropy_path)['entropy']
+        logger.info(f"Loaded entropy from {entropy_path}")
+
+    # Optionally load GTF annotations
+    gtf_features_all = None
+    if gtf_path and chrom:
+        try:
+            sys.path.insert(0, PROJECT_ROOT)
+            from tools.analyze_scoring_results import load_annotation_features
+            from run_sae_on_chromosome_drops import CHROM_MAP
+            chrom_id = CHROM_MAP.get(chrom, chrom)
+            all_starts = [r['region']['genomic_start'] for r in results]
+            all_ends = [r['region']['genomic_end'] for r in results]
+            gtf_features_all = load_annotation_features(
+                gtf_path, chrom_id,
+                max(0, min(all_starts) - 10000),
+                max(all_ends) + 10000,
+            )
+            logger.info(f"Loaded {len(gtf_features_all)} GTF features")
+        except Exception as e:
+            logger.warning(f"Could not load GTF: {e}")
+
+    # Determine which normalization modes to run
+    modes = ['zscore', 'minmax'] if normalize == 'both' else [normalize]
+
+    n_to_plot = n_plot_regions if n_plot_regions > 0 else n_regions
+    n_to_plot = min(n_to_plot, n_regions)
+
+    for mode in modes:
+        if mode == 'raw':
+            feature_stats = None
+            subdir = os.path.join(output_dir, 'region_plots_raw')
+        elif mode == 'zscore':
+            feature_stats = {'mean': feat_mean, 'std': feat_std}
+            subdir = os.path.join(output_dir, 'region_plots_zscore')
+        elif mode == 'minmax':
+            # Reuse the zscore dict interface but pass min/span as mean/std
+            feature_stats = {'mean': feat_min, 'std': feat_span}
+            subdir = os.path.join(output_dir, 'region_plots_minmax')
+        else:
+            continue
+
+        os.makedirs(subdir, exist_ok=True)
+        logger.info(f"Generating {n_to_plot} region plots ({mode} normalization) → {subdir}")
+
+        for i in range(n_to_plot):
+            fm = feature_matrices[i]
+            if fm is None:
+                continue
+            reg = results[i]['region']
+            result = {
+                'region': {
+                    **reg,
+                    'padded_start': reg['genomic_start'],
+                    'padded_end': reg['genomic_start'] + fm.shape[0],
+                    'drop_local_pos': fm.shape[0] // 4,
+                    'rise_local_pos': 3 * fm.shape[0] // 4,
+                },
+                'feature_ts': fm,
+                'top_feature_idx': results[i]['top_feature_idx'],
+                'drop_features': results[i]['drop_features'],
+                'rise_features': [],
+            }
+
+            # Get GTF features for this region
+            region_gtf = None
+            if gtf_features_all:
+                region_gtf = [f for f in gtf_features_all
+                              if f['end_exclusive'] > reg['genomic_start']
+                              and f['start'] < reg['genomic_end']]
+
+            out_path = os.path.join(subdir, f'region_{i+1:05d}_features.png')
+            try:
+                plot_region_figure4g(
+                    result, i, out_path, annotations=None,
+                    entropy=entropy, gtf_features=region_gtf,
+                    n_plot_features=n_plot_features,
+                    chrom=chrom or '',
+                    feature_stats=feature_stats,
+                )
+            except Exception as e:
+                logger.warning(f"  Region {i+1}: plot failed — {e}")
+
+            if (i + 1) % 20 == 0:
+                logger.info(f"  {i+1}/{n_to_plot} regions plotted")
+
+        logger.info(f"Done: {n_to_plot} plots in {subdir}")
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +692,18 @@ def parse_args():
                         help='Load normalized_maxpooled_vectors.npy instead of raw vectors '
                              'for feature activation plots (latent_analysis stage). '
                              'Plots are saved to plots/normalized/.')
+    # SAE per-region plot options
+    parser.add_argument('--normalize', default='both',
+                        choices=['zscore', 'minmax', 'both', 'raw'],
+                        help='Normalization for per-region feature plots (sae stage). '
+                             'zscore: z-score per feature; minmax: scale to [0,1]; '
+                             'both: generate both; raw: no normalization. Default: both')
+    parser.add_argument('--n_plot_regions', type=int, default=50,
+                        help='Number of top-confidence regions to plot (0 = all). Default: 50')
+    parser.add_argument('--n_plot_features', type=int, default=8,
+                        help='Number of features to show per region plot. Default: 8')
+    parser.add_argument('--entropy', default=None,
+                        help='Path to entropy .npz file for entropy panel overlay (sae stage)')
     parser.add_argument('--log_level', default='INFO', help='Logging level')
     return parser.parse_args()
 
@@ -575,9 +736,21 @@ def main():
 
     # Dispatch
     if stage == 'sae':
-        replot_sae(run_dir, output_dir, logger)
+        replot_sae(run_dir, output_dir, logger,
+                   normalize=args.normalize,
+                   n_plot_regions=args.n_plot_regions,
+                   n_plot_features=args.n_plot_features,
+                   entropy_path=args.entropy,
+                   gtf_path=args.gtf,
+                   chrom=args.chrom)
     elif stage == 'sae_with_latent':
-        replot_sae(run_dir, output_dir, logger)
+        replot_sae(run_dir, output_dir, logger,
+                   normalize=args.normalize,
+                   n_plot_regions=args.n_plot_regions,
+                   n_plot_features=args.n_plot_features,
+                   entropy_path=args.entropy,
+                   gtf_path=args.gtf,
+                   chrom=args.chrom)
         replot_latent_analysis(run_dir, output_dir, logger,
                                use_normalized=args.use_normalized)
     elif stage == 'sae_differential':
