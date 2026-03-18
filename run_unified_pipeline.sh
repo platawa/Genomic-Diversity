@@ -249,7 +249,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 echo "=== Scoring ${chrom} (partition=${partition}) ==="
 echo "Started: \$(date)"
 
-python score_chromosome.py --chrom ${chrom} --fasta ${FASTA} --output_dir ${RESULTS_DIR} --n_gpus ${n_gpus} --max_chunk_len 25000 --chunk_overlap 1024 --detection_methods zscore,mad ${score_flags}
+python score_chromosome.py --chrom ${chrom} --fasta ${FASTA} --output_dir ${RESULTS_DIR} --n_gpus ${n_gpus} --max_chunk_len 25000 --chunk_overlap 1024 --batch_size 1 --detection_methods zscore,mad ${score_flags}
 
 echo "Finished: \$(date)"
 SBATCH
