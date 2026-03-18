@@ -49,10 +49,10 @@ SCORE_MEM="100G"
 BATCH_SIZE=4
 
 # SAE drop analysis defaults
-SAE_TIME="04:00:00"
-SAE_MEM="50G"
+SAE_TIME="24:00:00"
+SAE_MEM="80G"
 SAE_CPUS=4
-SAE_MAX_REGIONS=1000
+SAE_MAX_REGIONS=999999
 SAE_MIN_CONFIDENCE=8.0
 
 # Analysis defaults
@@ -67,10 +67,11 @@ AGGREGATE_MEM="8G"
 # All human chromosomes (smallest first for faster initial results)
 ALL_CHROMS=(chr21 chr22 chrY chr20 chr19 chr18 chr17 chr16 chr15 chr14 chr13 chrX chr12 chr11 chr10 chr9 chr8 chr7 chr6 chr5 chr4 chr3 chr2 chr1)
 
-# Chromosome size categories (determines partition routing and time limits)
-# Large: >200 Mbp → preemptable only (needs >6h)
-# Small/Medium: <200 Mbp → can fit in 6h on mit_normal_gpu
-LARGE_CHROMS="chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8"
+# Chromosome size categories (determines partition routing, GPU count, and time limits)
+# Large:  >150 Mbp → preemptable, 1 GPU, 48h      (chr1-chr8, chrX)
+# Small:  ≤150 Mbp → mit_normal_gpu, 1 GPU, 6h    (chr9-chr22, chrY)
+# NOTE: 2-GPU routing removed — multiprocessing deadlocks; 1 GPU is stable
+LARGE_CHROMS="chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chrX"
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 DRY_RUN=false
@@ -138,6 +139,7 @@ is_large_chrom() {
     [[ " $LARGE_CHROMS " == *" $chrom "* ]]
 }
 
+
 get_scoring_partition() {
     local chrom="$1"
     if is_large_chrom "$chrom"; then
@@ -154,6 +156,14 @@ get_scoring_time() {
     else
         echo "06:00:00"
     fi
+}
+
+get_scoring_gpus() {
+    echo "$SCORE_GPUS"
+}
+
+get_scoring_mem() {
+    echo "$SCORE_MEM"
 }
 
 has_completed() {
@@ -215,6 +225,8 @@ for chrom in "${CHROMS[@]}"; do
         else
             partition=$(get_scoring_partition "$chrom")
             time_limit=$(get_scoring_time "$chrom")
+            n_gpus=$(get_scoring_gpus "$chrom")
+            score_mem=$(get_scoring_mem "$chrom")
 
             # Smart SAE stats: collect if no existing sae_global_stats
             sae_flag=""
@@ -234,31 +246,23 @@ for chrom in "${CHROMS[@]}"; do
 #!/bin/bash
 #SBATCH -J score_${chrom}
 #SBATCH -p ${partition}
-#SBATCH --gres=gpu:${SCORE_GPUS}
+#SBATCH --gres=gpu:${n_gpus}
 #SBATCH --cpus-per-task=${SCORE_CPUS}
-#SBATCH --mem=${SCORE_MEM}
+#SBATCH --mem=${score_mem}
 #SBATCH -t ${time_limit}
 #SBATCH -o ${PROJECT_DIR}/logs/score_${chrom}_%j.out
 #SBATCH -e ${PROJECT_DIR}/logs/score_${chrom}_%j.err
+#SBATCH --requeue
 
 cd ${PROJECT_DIR}
 module load miniforge/24.3.0-0
 conda activate ${CONDA_ENV}
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 echo "=== Scoring ${chrom} (partition=${partition}) ==="
 echo "Started: \$(date)"
 
-python score_chromosome.py \\
-    --chrom ${chrom} \\
-    --fasta ${FASTA} \\
-    --output_dir ${RESULTS_DIR} \\
-    --n_gpus ${SCORE_GPUS} \\
-    --auto_chunk_size \\
-    --bf16 \\
-    --batch_size ${BATCH_SIZE} \\
-    --detection_methods zscore,mad \\
-    --skip_if_completed \\
-    ${score_flags} ${sae_flag}
+python score_chromosome.py --chrom ${chrom} --fasta ${FASTA} --output_dir ${RESULTS_DIR} --n_gpus ${n_gpus} --auto_chunk_size --bf16 --batch_size ${BATCH_SIZE} --detection_methods zscore,mad --skip_if_completed ${score_flags} ${sae_flag}
 
 echo "Finished: \$(date)"
 SBATCH
@@ -286,13 +290,7 @@ cd ${PROJECT_DIR}
 module load miniforge/24.3.0-0
 conda activate ${CONDA_ENV}
 
-python tools/analyze_scoring_results.py \\
-    --auto \\
-    --chrom ${chrom} \\
-    --results_dir ${RESULTS_DIR} \\
-    --gtf ${GTF} \\
-    --all_plots \\
-    --dashboard
+python tools/analyze_scoring_results.py --auto --chrom ${chrom} --results_dir ${RESULTS_DIR} --gtf ${GTF} --all_plots --dashboard
 SBATCH
 )
 
@@ -304,29 +302,21 @@ SBATCH
         sae_drop_script=$(cat <<SBATCH
 #!/bin/bash
 #SBATCH -J sae_drops_${chrom}
-#SBATCH -p ${GPU_PARTITION_SMALL}
+#SBATCH -p ${GPU_PARTITION_LARGE}
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=${SAE_CPUS}
 #SBATCH --mem=${SAE_MEM}
 #SBATCH -t ${SAE_TIME}
 #SBATCH -o ${PROJECT_DIR}/logs/sae_drops_${chrom}_%j.out
 #SBATCH -e ${PROJECT_DIR}/logs/sae_drops_${chrom}_%j.err
+#SBATCH --requeue
 
 cd ${PROJECT_DIR}
 module load miniforge/24.3.0-0
 conda activate ${CONDA_ENV}
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-python run_sae_on_chromosome_drops.py \\
-    --auto \\
-    --chrom ${chrom} \\
-    --fasta ${FASTA} \\
-    --gtf ${GTF} \\
-    --output_dir ${RESULTS_DIR} \\
-    --max_regions ${SAE_MAX_REGIONS} \\
-    --min_confidence ${SAE_MIN_CONFIDENCE} \\
-    --stratified \\
-    --run_latent_analysis \\
-    --latent_only
+python run_sae_on_chromosome_drops.py --auto --chrom ${chrom} --fasta ${FASTA} --gtf ${GTF} --output_dir ${RESULTS_DIR} --max_regions ${SAE_MAX_REGIONS} --min_confidence ${SAE_MIN_CONFIDENCE} --run_latent_analysis --latent_only
 SBATCH
 )
 
@@ -357,10 +347,7 @@ cd ${PROJECT_DIR}
 module load miniforge/24.3.0-0
 conda activate ${CONDA_ENV}
 
-python tools/scan_sae_global_stats.py \\
-    --aggregate \\
-    --results_dir ${RESULTS_DIR} \\
-    --all_human
+python tools/scan_sae_global_stats.py --aggregate --results_dir ${RESULTS_DIR} --all_human
 SBATCH
 )
 

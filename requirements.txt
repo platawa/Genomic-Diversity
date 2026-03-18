@@ -1,0 +1,27 @@
+# Genomic Diversity — Evo 2 Entropy Scoring Pipeline
+# Install with: pip install -r requirements.txt
+#
+# Note: Evo 2 and its dependencies (transformer_engine, vtx) must be
+# installed separately. See https://github.com/ArcInstitute/evo2
+
+# Core computation
+numpy>=1.24
+torch>=2.1
+scipy>=1.11
+
+# Data handling
+pandas>=2.0
+biopython>=1.81
+
+# Visualization
+matplotlib>=3.7
+seaborn>=0.12
+
+# Machine learning (evaluation metrics, clustering)
+scikit-learn>=1.3
+
+# Model downloading
+huggingface_hub>=0.19
+
+# System monitoring (benchmarks)
+psutil>=5.9
