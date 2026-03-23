@@ -158,8 +158,10 @@ def main():
     for chrom, run_info in sorted(runs.items()):
         print(f"\n  {chrom}:")
         entropy_stats = compute_entropy_stats(run_info['entropy_path'])
+        mean_e = entropy_stats.get('mean_entropy', None)
+        mean_str = f"{mean_e:.4f}" if mean_e is not None else "N/A"
         print(f"    {entropy_stats['n_valid']:,} valid positions, "
-              f"mean entropy={entropy_stats.get('mean_entropy', 'N/A'):.4f}")
+              f"mean entropy={mean_str}")
 
         entry = {
             'chrom': chrom,

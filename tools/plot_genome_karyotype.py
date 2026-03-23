@@ -303,6 +303,134 @@ def plot_drop_density_karyotype(chrom_density, chrom_order, bin_size, output_pat
     logger.info(f"Saved drop density karyotype: {output_path}")
 
 
+def plot_combined_karyotype(chrom_entropy, chrom_density, chrom_order, bin_size,
+                            output_path, centromeres=None,
+                            title="Genome-wide Entropy & Drop Density"):
+    """Two thin tracks per chromosome: entropy (top) + drop density (bottom)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    from matplotlib.patches import Rectangle
+
+    chroms_to_plot = [c for c in chrom_order if c in chrom_entropy]
+    if not chroms_to_plot:
+        return
+
+    n_chroms = len(chroms_to_plot)
+    max_size = max(CHROM_SIZES_GRCH38.get(c, 0) for c in chroms_to_plot)
+
+    # Colour limits
+    all_e = np.concatenate([chrom_entropy[c] for c in chroms_to_plot])
+    finite_e = all_e[np.isfinite(all_e)]
+    emin = float(np.percentile(finite_e, 1)) if len(finite_e) else 0.0
+    emax = float(np.percentile(finite_e, 99)) if len(finite_e) else 1.0
+
+    all_d = np.concatenate([chrom_density[c].astype(float) for c in chroms_to_plot
+                            if c in chrom_density])
+    dmax = max(float(np.max(all_d)), 1) if len(all_d) else 1.0
+
+    ecmap = plt.cm.RdYlBu_r.copy(); ecmap.set_bad(color="#c8c8c8")
+    dcmap = plt.cm.YlOrRd.copy();   dcmap.set_under(color="white")
+    enorm = mcolors.Normalize(vmin=emin, vmax=emax)
+    dnorm = mcolors.Normalize(vmin=0,    vmax=dmax)
+
+    # Geometry — everything fits within row_pitch so rows never overlap
+    row_pitch   = 1.0    # y-distance between consecutive chromosome rows
+    intra_gap   = 0.06   # gap between the two sub-tracks within one row
+    inter_gap   = 0.12   # whitespace kept clear between rows
+    track_h     = (row_pitch - intra_gap - inter_gap) / 2   # ≈ 0.41
+
+    fig_height = max(6.0, 0.50 * n_chroms + 2.0)
+    # Leave room on the right for two colorbars
+    fig, ax = plt.subplots(figsize=(13, fig_height))
+    fig.subplots_adjust(right=0.84)
+
+    for i, chrom in enumerate(chroms_to_plot):
+        yc = (n_chroms - 1 - i) * row_pitch   # row centre
+
+        # Entropy track occupies [yc + intra_gap/2 , yc + intra_gap/2 + track_h]
+        ye_lo = yc + intra_gap / 2
+        ye_hi = ye_lo + track_h
+
+        # Drop density track occupies [yc - intra_gap/2 - track_h , yc - intra_gap/2]
+        yd_hi = yc - intra_gap / 2
+        yd_lo = yd_hi - track_h
+
+        chrom_size = CHROM_SIZES_GRCH38.get(chrom, 0)
+        chrom_mb   = (chrom_size or 1) / 1e6
+
+        # Entropy
+        binned = chrom_entropy[chrom]
+        ext_e  = [0, len(binned) * bin_size / 1e6, ye_lo, ye_hi]
+        ax.imshow(binned.reshape(1, -1), aspect="auto", cmap=ecmap, norm=enorm,
+                  extent=ext_e, interpolation="none", origin="lower")
+        ax.add_patch(Rectangle((0, ye_lo), chrom_mb, track_h,
+                               linewidth=0.4, edgecolor="#444", facecolor="none", zorder=3))
+
+        # Drop density
+        if chrom in chrom_density:
+            counts = chrom_density[chrom].astype(np.float64)
+            ext_d  = [0, len(counts) * bin_size / 1e6, yd_lo, yd_hi]
+            ax.imshow(counts.reshape(1, -1), aspect="auto", cmap=dcmap, norm=dnorm,
+                      extent=ext_d, interpolation="none", origin="lower")
+            ax.add_patch(Rectangle((0, yd_lo), chrom_mb, track_h,
+                                   linewidth=0.4, edgecolor="#444", facecolor="none", zorder=3))
+
+        # Centromere tick spanning both tracks
+        if centromeres and chrom in centromeres:
+            cen_mb = sum(centromeres[chrom]) / 2e6
+            ax.plot([cen_mb, cen_mb], [yd_lo, ye_hi], color="black",
+                    lw=1.0, zorder=4, solid_capstyle="butt")
+
+    # Y-axis labels at row centres
+    centres    = [(n_chroms - 1 - i) * row_pitch for i in range(n_chroms)]
+    ax.set_yticks(centres)
+    ax.set_yticklabels(chroms_to_plot, fontsize=8.5)
+    ax.set_xlabel("Genomic Position (Mb)", fontsize=11)
+    ax.set_xlim(0, max_size / 1e6 * 1.01)
+    ax.set_ylim(-row_pitch * 0.55, (n_chroms - 1) * row_pitch + row_pitch * 0.55)
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=10)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(axis="x", labelsize=9)
+
+    # Two colorbars placed manually to the right of the axes
+    bb = ax.get_position()   # in figure fraction; updated after subplots_adjust
+    cb_w   = 0.018
+    cb_gap = 0.032
+    cb_x1  = bb.x1 + 0.025
+    cb_x2  = cb_x1 + cb_w + cb_gap
+
+    cax1 = fig.add_axes([cb_x1, bb.y0, cb_w, bb.height])
+    cax2 = fig.add_axes([cb_x2, bb.y0, cb_w, bb.height])
+
+    sm_e = plt.cm.ScalarMappable(cmap=ecmap, norm=enorm); sm_e.set_array([])
+    cb1  = fig.colorbar(sm_e, cax=cax1)
+    cb1.set_label("Entropy (nats)", fontsize=8)
+    cb1.ax.tick_params(labelsize=7)
+
+    sm_d = plt.cm.ScalarMappable(cmap=dcmap, norm=dnorm); sm_d.set_array([])
+    cb2  = fig.colorbar(sm_d, cax=cax2)
+    cb2.set_label("Drops / bin", fontsize=8)
+    cb2.ax.tick_params(labelsize=7)
+
+    if bin_size >= 1_000_000:
+        bin_label = f"{bin_size / 1e6:.1f} Mb bins"
+    elif bin_size >= 1000:
+        bin_label = f"{bin_size / 1e3:.0f} kb bins"
+    else:
+        bin_label = f"{bin_size} bp bins"
+    ax.annotate(f"{bin_label}  ·  top track = entropy  ·  bottom track = drop density",
+                xy=(0.0, -0.04), xycoords="axes fraction",
+                ha="left", va="top", fontsize=7, color="gray")
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    logger.info(f"Saved combined karyotype: {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Karyotype-style genome-wide entropy / drop-density visualization.",
@@ -402,6 +530,13 @@ def main():
         plot_drop_density_karyotype(
             chrom_drop_density, chrom_order, args.bin_size, density_path,
             centromeres=centromeres,
+        )
+
+    if chrom_drop_density:
+        combined_path = os.path.join(output_dir, "combined_karyotype.png")
+        plot_combined_karyotype(
+            chrom_entropy_binned, chrom_drop_density, chrom_order,
+            args.bin_size, combined_path, centromeres=centromeres,
         )
 
     write_source(run_dir_out, **{c: d for c, d in source_runs.items()})
