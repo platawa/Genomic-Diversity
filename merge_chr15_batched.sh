@@ -58,8 +58,8 @@ def merge_batch(batch_num, start_idx, end_idx):
         print(f"[Batch {batch_num}] ERROR: No shards found!")
         return False
 
-    # Merge this batch
-    output_dir = os.path.join(PROJECT, "results", CHROM, "sae", f"batch{batch_num}_merged")
+    # Merge this batch to SEPARATE output dir (don't conflict with monitored merge)
+    output_dir = os.path.join(PROJECT, "results", CHROM, "sae", f"20260325_batched_{batch_num:02d}_merged")
     os.makedirs(output_dir, exist_ok=True)
 
     try:
