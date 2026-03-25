@@ -2,9 +2,16 @@
 """
 genome_sae_tsne.py
 
-Aggregate SAE region fingerprints across multiple chromosomes, compute t-SNE
-(and optionally UMAP) on the combined matrix, and color by GTF annotation
-(CDS / UTR-exon / Intron / Intergenic).
+Aggregate SAE region fingerprints across all chromosomes, compute genome-wide
+t-SNE/UMAP embeddings with Leiden clustering, and generate multi-color plots:
+  - Genomic annotation (CDS / UTR-exon / Intron / Intergenic)
+  - Individual annotation types (separate plots for each)
+  - Chromosome ID
+  - Detection method (zscore / MAD)
+  - Leiden cluster assignment
+  - Continuous properties (confidence, region length)
+
+Saves embedding checkpoints for fast plot regeneration without re-computing.
 
 Reuses existing functions from:
   - analyze_sae_regions.py: compute_embedding_and_clusters(), load_region_metadata()
@@ -12,17 +19,41 @@ Reuses existing functions from:
   - tools/aggregate_genome_sae_stats.py: load_maxpooled_vectors(), ALL_HUMAN_CHROMS
   - results_utils.py: find_latest_completed(), write_completed(), write_source()
 
+Generated plots (per embedding method):
+  - tsne/umap_by_annotation.png — all annotation types
+  - tsne/umap_annotation_{cds,utr_exon,intron,intergenic}.png — individual types
+  - tsne/umap_annotation_and_confidence.png — side-by-side
+  - tsne/umap_continuous.png — confidence + region length
+  - tsne/umap_by_chromosome.png — chromosome ID
+  - tsne/umap_by_method.png — detection method
+  - tsne/umap_by_cluster.png — Leiden clusters
+
+Checkpoints saved in data/:
+  - embedding_tsne.npy, embedding_umap.npy — for fast plot regeneration
+  - cluster_assignments_array.npy — cluster IDs
+  - cluster_assignments.tsv — full table with coordinates
+
 Usage:
+    # All human chromosomes, both t-SNE and UMAP
     python tools/genome_sae_tsne.py \\
         --all_human \\
         --gtf /path/to/genomic.gtf \\
         --results_dir results/ \\
         --embedding both
 
+    # Specific chromosomes, z-score normalized
     python tools/genome_sae_tsne.py \\
         --chroms chr21 chr22 \\
         --gtf /path/to/genomic.gtf \\
-        --embedding tsne
+        --embedding tsne \\
+        --global_stats results/_global_stats/global_feature_stats.npz
+
+    # t-SNE only, custom Leiden resolution
+    python tools/genome_sae_tsne.py \\
+        --all_human \\
+        --gtf /path/to/genomic.gtf \\
+        --embedding tsne \\
+        --leiden_resolution 0.5
 """
 
 import argparse
@@ -90,6 +121,9 @@ def parse_args():
                         help="Output directory (default: results/_genome_wide/sae_tsne/)")
     parser.add_argument("--max_regions_per_chrom", type=int, default=0,
                         help="Max regions per chromosome, 0=all (default: 0)")
+    parser.add_argument("--global_stats", type=str, default=None,
+                        help="Path to global_feature_stats.npz for z-score normalization "
+                             "of pooled vectors before embedding")
     parser.add_argument("--log_level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
@@ -170,6 +204,106 @@ def plot_by_chromosome(coords, chrom_labels, title, xlabel, ylabel, out_path):
     ax.set_title(title, fontsize=13)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    logger.info(f"Saved: {out_path}")
+    plt.close()
+
+
+def plot_single_annotation(coords, annotations, annotation_type, annotation_colors,
+                           title, xlabel, ylabel, out_path, point_size=15):
+    """Plot single annotation type only."""
+    mask = np.array([a == annotation_type for a in annotations])
+    if not mask.any():
+        logger.warning(f"No regions with annotation '{annotation_type}'")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.scatter(coords[mask, 0], coords[mask, 1],
+               c=annotation_colors.get(annotation_type, "#999999"),
+               s=point_size, alpha=0.7, edgecolors="none")
+    ax.set_title(title, fontsize=13)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    logger.info(f"Saved: {out_path}")
+    plt.close()
+
+
+def plot_by_method(coords, methods, title, xlabel, ylabel, out_path):
+    """Color points by detection method (zscore/MAD)."""
+    method_colors = {
+        "zscore": "#e74c3c",
+        "MAD": "#3498db",
+    }
+    unique_methods = sorted(set(methods))
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for method in unique_methods:
+        mask = np.array([m == method for m in methods])
+        ax.scatter(coords[mask, 0], coords[mask, 1],
+                   c=method_colors.get(method, "#999999"),
+                   label=f"{method} ({mask.sum()})",
+                   s=15, alpha=0.7, edgecolors="none")
+    ax.legend(fontsize=10, markerscale=2)
+    ax.set_title(title, fontsize=13)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    logger.info(f"Saved: {out_path}")
+    plt.close()
+
+
+def plot_by_cluster(coords, clusters, title, xlabel, ylabel, out_path):
+    """Color points by Leiden cluster."""
+    unique_clusters = sorted(np.unique(clusters))
+    cmap = plt.cm.get_cmap("tab20" if len(unique_clusters) <= 10 else "tab20b")
+    cluster_colors = {c: cmap(i % 20) for i, c in enumerate(unique_clusters)}
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    for c in unique_clusters:
+        mask = clusters == c
+        ax.scatter(coords[mask, 0], coords[mask, 1],
+                   c=[cluster_colors[c]], label=f"Cluster {c} ({mask.sum()})",
+                   s=15, alpha=0.7, edgecolors="none")
+    ax.legend(fontsize=8, markerscale=2, ncol=2, loc="best")
+    ax.set_title(title, fontsize=13)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    logger.info(f"Saved: {out_path}")
+    plt.close()
+
+
+def plot_continuous_colormaps(coords, confidences, region_lengths, title,
+                               xlabel, ylabel, out_path):
+    """Side-by-side: confidence and region length colormaps."""
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+
+    # Confidence
+    ax = axes[0]
+    sc1 = ax.scatter(coords[:, 0], coords[:, 1],
+                     c=confidences, cmap="viridis",
+                     s=15, alpha=0.7, edgecolors="none")
+    plt.colorbar(sc1, ax=ax, label="Confidence")
+    ax.set_title("Colored by Confidence")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    # Region length
+    ax = axes[1]
+    sc2 = ax.scatter(coords[:, 0], coords[:, 1],
+                     c=region_lengths, cmap="plasma",
+                     s=15, alpha=0.7, edgecolors="none")
+    plt.colorbar(sc2, ax=ax, label="Region Length (bp)")
+    ax.set_title("Colored by Region Length")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    fig.suptitle(title, fontsize=14, y=1.00)
     plt.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     logger.info(f"Saved: {out_path}")
@@ -264,6 +398,18 @@ def main():
     for chrom, cnt in chrom_region_counts.items():
         logger.info(f"  {chrom}: {cnt} regions")
 
+    # Optional: apply global z-score normalization
+    if args.global_stats:
+        logger.info(f"Applying genome-wide z-score normalization from {args.global_stats}")
+        gstats = dict(np.load(args.global_stats))
+        mean = gstats["mean"]
+        std = gstats["std"]
+        valid = gstats.get("valid_mask", std > 0)
+        normalized = np.zeros_like(combined)
+        normalized[:, valid] = (combined[:, valid] - mean[valid]) / std[valid]
+        combined = normalized
+        logger.info(f"  Normalized range: [{combined.min():.4f}, {combined.max():.4f}]")
+
     # ── 2. Compute embedding + clustering ────────────────────────────────────
     logger.info(f"\nComputing {args.embedding} embedding + Leiden clustering...")
     result = compute_embedding_and_clusters(
@@ -308,7 +454,7 @@ def main():
 
     logger.info(f"\nOutput dir: {run_dir}")
 
-    # ── 5. Generate plots ────────────────────────────────────────────────────
+    # ── 5. Prepare metadata for plotting ──────────────────────────────────────
     annotation_colors = {
         "CDS": "#e41a1c",
         "UTR/exon": "#ff7f00",
@@ -318,7 +464,23 @@ def main():
     annotation_order = ["CDS", "UTR/exon", "Intron", "Intergenic"]
     chrom_labels = [m["chrom"] for m in all_metadata]
     confidences = np.array([m.get("confidence", 0.0) for m in all_metadata])
+    region_lengths = np.array([m.get("region_length", 0) for m in all_metadata])
+    methods = [m.get("method", "unknown") for m in all_metadata]
 
+    # ── 5a. Save embeddings as checkpoints ─────────────────────────────────
+    logger.info(f"\nSaving embedding checkpoints...")
+    if result.get("embedding_tsne") is not None:
+        np.save(os.path.join(data_dir, "embedding_tsne.npy"), result["embedding_tsne"])
+        logger.info(f"Saved embedding_tsne.npy: {result['embedding_tsne'].shape}")
+    if result.get("embedding_umap") is not None:
+        np.save(os.path.join(data_dir, "embedding_umap.npy"), result["embedding_umap"])
+        logger.info(f"Saved embedding_umap.npy: {result['embedding_umap'].shape}")
+    np.save(os.path.join(data_dir, "cluster_assignments_array.npy"),
+            result["cluster_assignments"])
+    logger.info(f"Saved cluster_assignments_array.npy: {result['cluster_assignments'].shape}")
+
+    # ── 5b. Generate plots ─────────────────────────────────────────────────
+    logger.info(f"\nGenerating plots...")
     for emb_name, emb_key in [("tsne", "embedding_tsne"), ("umap", "embedding_umap")]:
         coords = result.get(emb_key)
         if coords is None:
@@ -328,7 +490,7 @@ def main():
         xlabel = f"{prefix} 1"
         ylabel = f"{prefix} 2"
 
-        # Annotation plot
+        # --- Annotation plots ---
         plot_embedding(
             coords, annotations, annotation_colors, annotation_order,
             title=f"{prefix} of SAE Region Fingerprints — {n_chroms} Chromosomes "
@@ -336,6 +498,15 @@ def main():
             xlabel=xlabel, ylabel=ylabel,
             out_path=os.path.join(plots_dir, f"{emb_name}_by_annotation.png"),
         )
+
+        # Individual annotation type plots
+        for ann_type in annotation_order:
+            plot_single_annotation(
+                coords, annotations, ann_type, annotation_colors,
+                title=f"{prefix} of SAE Regions — {ann_type} Only (N={sum(a == ann_type for a in annotations)})",
+                xlabel=xlabel, ylabel=ylabel,
+                out_path=os.path.join(plots_dir, f"{emb_name}_annotation_{ann_type.lower().replace('/', '_')}.png"),
+            )
 
         # Annotation + confidence side by side
         plot_annotation_and_confidence(
@@ -346,6 +517,14 @@ def main():
             out_path=os.path.join(plots_dir, f"{emb_name}_annotation_and_confidence.png"),
         )
 
+        # Continuous colormaps (confidence + region length)
+        plot_continuous_colormaps(
+            coords, confidences, region_lengths,
+            title=f"{prefix} of SAE Regions — Continuous Properties",
+            xlabel=xlabel, ylabel=ylabel,
+            out_path=os.path.join(plots_dir, f"{emb_name}_continuous.png"),
+        )
+
         # By chromosome
         plot_by_chromosome(
             coords, chrom_labels,
@@ -353,6 +532,22 @@ def main():
                   f"(N={n_total})",
             xlabel=xlabel, ylabel=ylabel,
             out_path=os.path.join(plots_dir, f"{emb_name}_by_chromosome.png"),
+        )
+
+        # By detection method
+        plot_by_method(
+            coords, methods,
+            title=f"{prefix} of SAE Regions — Colored by Detection Method",
+            xlabel=xlabel, ylabel=ylabel,
+            out_path=os.path.join(plots_dir, f"{emb_name}_by_method.png"),
+        )
+
+        # By cluster
+        plot_by_cluster(
+            coords, result["cluster_assignments"],
+            title=f"{prefix} of SAE Regions — Leiden Clusters (N={result['n_clusters']})",
+            xlabel=xlabel, ylabel=ylabel,
+            out_path=os.path.join(plots_dir, f"{emb_name}_by_cluster.png"),
         )
 
     # ── 6. Save data outputs ─────────────────────────────────────────────────

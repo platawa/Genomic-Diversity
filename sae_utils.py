@@ -31,12 +31,25 @@ SAE weights: Goodfire/Evo-2-Layer-26-Mixed
 
 from typing import List, Optional, Callable, Dict, Any, Tuple
 from collections import defaultdict
+import contextlib
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 from huggingface_hub import hf_hub_download
+
+# Disable FP8 on GPUs with compute capability < 8.9 (A100=8.0, H100=9.0).
+# FP8 calibration allows the first ~16 batches to pass, but then crashes on A100.
+# Patch te.fp8_autocast to a no-op so the model runs in bf16 on non-H100 nodes.
+try:
+    import transformer_engine.pytorch as te
+    if torch.cuda.is_available():
+        cc = torch.cuda.get_device_capability()
+        if not (cc[0] > 8 or (cc[0] == 8 and cc[1] >= 9)):
+            te.fp8_autocast = lambda *args, **kwargs: contextlib.nullcontext()
+except Exception:
+    pass
 
 # Import Evo2 - handle different import paths
 try:
@@ -678,6 +691,65 @@ def get_feature_ts(
             features = sae.encode(acts[layer_name][0].to(sae_device))
 
     return features.cpu().detach().float().numpy()
+
+
+def get_feature_ts_batch(
+    model: ObservableEvo2,
+    sae: BatchTopKTiedSAE,
+    seqs: List[str],
+    layer_name: str = SAE_LAYER_NAME,
+) -> List[np.ndarray]:
+    """
+    Extract SAE feature time series for a batch of DNA sequences in one forward pass.
+
+    Sequences are right-padded to the same length within the batch. Because Evo2
+    uses causal (autoregressive) attention, padding tokens appended after a sequence
+    never affect activations at earlier positions, so this is equivalent to running
+    each sequence individually.
+
+    Args:
+        model: ObservableEvo2 instance
+        sae: BatchTopKTiedSAE instance
+        seqs: List of DNA sequence strings (variable length)
+        layer_name: Layer to extract activations from (default: 'blocks-26')
+
+    Returns:
+        List of numpy arrays, one per sequence, each shape (seq_len_i, 32768).
+        Order matches the input seqs list.
+    """
+    if len(seqs) == 1:
+        return [get_feature_ts(model, sae, seqs[0], layer_name)]
+
+    # Compile SAE encoder once on first call
+    if not getattr(sae, '_encode_compiled', False):
+        try:
+            sae.encode = torch.compile(sae.encode)
+            sae._encode_compiled = True
+        except Exception:
+            sae._encode_compiled = True
+
+    # Tokenize all sequences; track real lengths for slicing after forward pass
+    tokenized = [model.tokenizer.tokenize(seq) for seq in seqs]
+    lengths = [len(t) for t in tokenized]
+    max_len = max(lengths)
+
+    # Right-pad with token 0 (safe for causal models: padding after real content
+    # is never attended to by any real position)
+    padded = [t + [0] * (max_len - len(t)) for t in tokenized]
+    toks = torch.tensor(padded, dtype=torch.long).to(model.device)  # (B, max_len)
+
+    with torch.inference_mode():
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            logits, acts = model.forward(toks, cache_activations_at=[layer_name])
+
+            sae_device = next(iter(sae.parameters())).device
+            layer_acts = acts[layer_name].to(sae_device)  # (B, max_len, d_hidden)
+            features = sae.encode(layer_acts)              # (B, max_len, 32768)
+
+    features_cpu = features.cpu().detach().float().numpy()
+
+    # Slice out only real (non-padded) positions for each sequence
+    return [features_cpu[i, :lengths[i], :] for i in range(len(seqs))]
 
 
 def get_feature_ts_via_generate(

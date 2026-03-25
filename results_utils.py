@@ -91,6 +91,32 @@ def find_latest_completed(base_dir, chrom, stage):
     return os.path.join(stage_dir, completed_runs[-1])
 
 
+def find_latest_completed_global(base_dir, subdir):
+    """Find the most recent COMPLETED run in a global (non-chromosome) directory.
+
+    Scans results/{subdir}/ for subdirectories containing a COMPLETED file.
+    Used for genome-wide outputs like _genome_sae_stats/.
+
+    Returns:
+        Path to the run directory, or None if no completed run exists.
+    """
+    search_dir = os.path.join(base_dir, subdir)
+    if not os.path.isdir(search_dir):
+        return None
+
+    completed_runs = []
+    for entry in os.listdir(search_dir):
+        run_path = os.path.join(search_dir, entry)
+        if os.path.isdir(run_path) and os.path.isfile(os.path.join(run_path, "COMPLETED")):
+            completed_runs.append(entry)
+
+    if not completed_runs:
+        return None
+
+    completed_runs.sort()
+    return os.path.join(search_dir, completed_runs[-1])
+
+
 def find_all_completed(base_dir, chroms, stage):
     """Find completed runs for multiple chromosomes.
 

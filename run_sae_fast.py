@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run_sae_on_chromosome_drops.py
+run_sae_fast.py  (optimized copy of run_sae_on_chromosome_drops.py)
 
 ================================================================================
 OVERVIEW
@@ -82,6 +82,7 @@ import sys
 import json
 import argparse
 import logging
+import threading
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
@@ -178,7 +179,7 @@ ANNOTATION_COLORS = {
 
 # SAE analysis defaults
 DEFAULT_MIN_CONFIDENCE = 2.5
-DEFAULT_MAX_REGIONS = 50
+DEFAULT_MAX_REGIONS = 0  # 0 = no cap (process ALL qualifying regions)
 DEFAULT_PADDING = 500
 DEFAULT_TOP_FEATURES_PER_REGION = 10
 DEFAULT_N_PLOT_FEATURES = 10
@@ -634,23 +635,26 @@ def run_sae_on_regions(
     start_idx = 0
 
     # ---- checkpoint paths ----
-    chk_npz  = os.path.join(checkpoint_dir, '_checkpoint.npz')       if checkpoint_dir else None
+    # In extract_only mode we write per-chunk feature files so that no chunk's
+    # feature_ts is ever overwritten with None.  The meta file tracks progress.
     chk_meta = os.path.join(checkpoint_dir, '_checkpoint_meta.json') if checkpoint_dir else None
 
+    def _chunk_npz_path(chunk_start: int, chunk_end: int) -> str:
+        return os.path.join(checkpoint_dir, f'_chunk_{chunk_start:07d}_{chunk_end:07d}.npz')
+
     # ---- resume from existing checkpoint ----
-    if chk_npz and os.path.exists(chk_npz) and os.path.exists(chk_meta):
+    if chk_meta and os.path.exists(chk_meta):
         try:
-            chk_data = np.load(chk_npz)
             with open(chk_meta) as f:
                 meta = json.load(f)
             n_done = meta['n_done']
             for i in range(n_done):
                 results[i] = {
-                    'region':         regions[i],
-                    'feature_ts':     chk_data[f'region_{i}'] if not extract_only else None,
+                    'region':          regions[i],
+                    'feature_ts':      None,   # always None on resume (reloaded in step 6b)
                     'top_feature_idx': meta['top_feature_idx'][i],
-                    'drop_features':  [tuple(x) for x in meta['drop_features'][i]],
-                    'rise_features':  [tuple(x) for x in meta['rise_features'][i]],
+                    'drop_features':   [tuple(x) for x in meta['drop_features'][i]],
+                    'rise_features':   [tuple(x) for x in meta['rise_features'][i]],
                 }
             start_idx = n_done
             if logger:
@@ -658,25 +662,56 @@ def run_sae_on_regions(
         except Exception as exc:
             if logger:
                 logger.warning(f"[checkpoint] Load failed ({exc}), starting fresh")
-            results    = [None] * n
-            start_idx  = 0
+            results   = [None] * n
+            start_idx = 0
 
-    # ---- helper: save checkpoint for the first n_done results ----
-    def _save_checkpoint(n_done: int):
+    # ---- async checkpoint: overlap disk I/O with next GPU chunk ----
+    _chk_thread: Optional[threading.Thread] = None
+
+    def _save_checkpoint(chunk_start: int, chunk_end: int):
+        """Fire-and-forget checkpoint — overlaps with the next GPU chunk.
+
+        Feature matrices for this chunk go to a per-chunk NPZ file so that
+        cleared (None) regions from earlier chunks are never overwritten.
+        Cumulative metadata goes to the shared JSON for resume logic.
+        """
+        nonlocal _chk_thread
         if not checkpoint_dir:
             return
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        matrix_dict = {f'region_{i}': results[i]['feature_ts'] for i in range(n_done)}
-        np.savez_compressed(chk_npz, **matrix_dict)
-        with open(chk_meta, 'w') as f:
-            json.dump({
-                'n_done':          n_done,
-                'top_feature_idx': [results[i]['top_feature_idx'] for i in range(n_done)],
-                'drop_features':   [results[i]['drop_features']   for i in range(n_done)],
-                'rise_features':   [results[i]['rise_features']   for i in range(n_done)],
-            }, f)
-        if logger:
-            logger.info(f"[checkpoint] Saved {n_done}/{n} regions")
+
+        # Wait for any in-flight write before starting a new one
+        if _chk_thread is not None:
+            _chk_thread.join()
+
+        # Per-chunk feature snapshot (only current chunk, all non-None)
+        chunk_matrix = {
+            f'region_{i}': results[i]['feature_ts']
+            for i in range(chunk_start, chunk_end)
+            if results[i] is not None and results[i].get('feature_ts') is not None
+        }
+
+        # Cumulative metadata snapshot (all completed regions so far)
+        n_done = chunk_end
+        meta_snapshot = {
+            'n_done':          n_done,
+            'top_feature_idx': [results[i]['top_feature_idx'] for i in range(n_done)],
+            'drop_features':   [results[i]['drop_features']   for i in range(n_done)],
+            'rise_features':   [results[i]['rise_features']   for i in range(n_done)],
+        }
+
+        chunk_path = _chunk_npz_path(chunk_start, chunk_end)
+
+        def _write():
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            if chunk_matrix:
+                np.savez_compressed(chunk_path, **chunk_matrix)
+            with open(chk_meta, 'w') as f:
+                json.dump(meta_snapshot, f)
+            if logger:
+                logger.info(f"[checkpoint] Saved chunk {chunk_start}-{chunk_end} / {n}")
+
+        _chk_thread = threading.Thread(target=_write, daemon=True)
+        _chk_thread.start()
 
     # ---- helper: build result dict for one region ----
     def _make_result(i: int, feature_ts: np.ndarray) -> Dict[str, Any]:
@@ -730,13 +765,19 @@ def run_sae_on_regions(
                 results[i] = _make_result(i, fts)
 
         # Checkpoint after completing the chunk
-        _save_checkpoint(chunk_end)
+        _save_checkpoint(chunk_start, chunk_end)
 
-        # In extract_only mode, release feature_ts from memory after saving —
-        # peak RAM stays proportional to checkpoint_interval, not total regions
+        # In extract_only mode, release feature_ts from memory after saving.
+        # Join the thread first so the NPZ is fully written before we clear.
         if extract_only:
+            if _chk_thread is not None:
+                _chk_thread.join()
             for i in range(chunk_start, chunk_end):
                 results[i]['feature_ts'] = None
+
+    # Ensure the final checkpoint write finishes before returning
+    if _chk_thread is not None:
+        _chk_thread.join()
 
     return results
 
@@ -1951,16 +1992,36 @@ Examples:
                              "checkpoint chunk so peak memory scales with "
                              "--checkpoint_interval rather than total regions. Recommended "
                              "when running large --max_regions (thousands) on GPU nodes.")
-    parser.add_argument("--batch_size", type=int, default=1,
-                        help="Sequences per GPU forward pass (default: 1). Regions within "
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="Sequences per GPU forward pass (default: 8). Regions within "
                              "each checkpoint chunk are sorted by length before batching to "
                              "minimise padding. Values of 4-8 typically give the best "
                              "throughput on H200 for drop regions of a few hundred bp.")
+    parser.add_argument("--shard", type=str, default=None,
+                        metavar="N/M",
+                        help="Process only shard N of M (0-indexed). E.g. --shard 0/4 "
+                             "processes the first quarter of qualifying regions. Submit M "
+                             "jobs in parallel (each with a different N) to distribute "
+                             "work across M GPUs. Shard tag is appended to the output dir "
+                             "name so each shard writes to its own directory. After all "
+                             "shards complete, run merge_sae_shards.py to combine them.")
     parser.add_argument("--checkpoint_interval", type=int, default=200,
                         help="Save a resume checkpoint every N regions (default: 200). "
                              "In --extract_only mode this also controls peak RAM usage.")
 
     args = parser.parse_args()
+
+    # Parse --shard N/M
+    shard_idx, n_shards = None, None
+    if args.shard is not None:
+        try:
+            parts = args.shard.split('/')
+            shard_idx = int(parts[0])
+            n_shards  = int(parts[1])
+            assert 0 <= shard_idx < n_shards, f"shard index {shard_idx} out of range [0, {n_shards})"
+        except Exception as e:
+            print(f"ERROR: --shard must be N/M (e.g. 0/4), got: {args.shard!r} ({e})")
+            sys.exit(1)
 
     # Setup
     import time as _time
@@ -1995,8 +2056,10 @@ Examples:
         desc_parts.append("overlap")
     if args.stratified:
         desc_parts.append("stratified")
-    desc_parts.append(f"max{args.max_regions}")
+    desc_parts.append(f"max{args.max_regions}" if args.max_regions > 0 else "all")
     desc_parts.append(f"conf{args.min_confidence}")
+    if shard_idx is not None:
+        desc_parts.append(f"shard{shard_idx}of{n_shards}")
     descriptor = "_".join(desc_parts)
 
     run_dir = build_run_dir(args.output_dir, args.chrom, "sae", descriptor)
@@ -2050,7 +2113,7 @@ Examples:
             )
             sys.exit(1)
 
-    # Now apply max_regions cap
+    # Apply max_regions cap (default 0 = no cap in run_sae_fast.py)
     if args.max_regions > 0 and len(regions) > args.max_regions:
         if args.stratified:
             regions = stratified_sample_regions(
@@ -2059,6 +2122,20 @@ Examples:
         else:
             logger.info(f"Capping to top {args.max_regions} regions (from {len(regions)})")
             regions = regions[:args.max_regions]
+
+    # Apply shard slicing: split regions evenly across n_shards, take shard shard_idx
+    if shard_idx is not None:
+        total_before_shard = len(regions)
+        # Contiguous slice: shard i gets indices [i*size, (i+1)*size)
+        shard_size  = (total_before_shard + n_shards - 1) // n_shards  # ceil division
+        shard_start = shard_idx * shard_size
+        shard_end   = min(shard_start + shard_size, total_before_shard)
+        regions = regions[shard_start:shard_end]
+        logger.info(
+            f"[shard {shard_idx}/{n_shards}] Processing regions "
+            f"{shard_start}–{shard_end-1} of {total_before_shard} "
+            f"({len(regions)} regions in this shard)"
+        )
 
     logger.info(f"Using {len(regions)} regions")
     for i, r in enumerate(regions[:5]):
@@ -2181,55 +2258,57 @@ Examples:
     logger.info("-" * 70)
 
     if args.extract_only:
-        # Reload from the checkpoint npz that was built incrementally
-        chk_path = os.path.join(args.output_dir, 'data', '_checkpoint.npz')
-        chk_data  = np.load(chk_path)
-        all_acts  = np.concatenate(
-            [chk_data[f'region_{i}'] for i in range(len(results))], axis=0
-        )
+        # In extract_only mode, skip steps 6b/7/8 entirely.
+        # Norm stats and signature features are computed later by
+        # merge_sae_shards.py / finish_merges.py using memory-efficient
+        # streaming (Welford's algorithm), avoiding the OOM from loading
+        # all chunk data into one giant array.
+        logger.info("--extract_only: skipping steps 6b/7/8 (deferred to merge)")
+        feature_stats = None
+        signatures = []
     else:
         all_acts = np.concatenate([r['feature_ts'] for r in results], axis=0)
 
-    feature_mean  = all_acts.mean(axis=0)
-    feature_std   = np.maximum(all_acts.std(axis=0), 1e-6)
-    feature_stats = {'mean': feature_mean, 'std': feature_std}
-    logger.info(f"  Normalization stats computed from {all_acts.shape[0]:,} positions "
-                f"across {len(results)} regions")
-    del all_acts  # free memory
+        feature_mean  = all_acts.mean(axis=0)
+        feature_std   = np.maximum(all_acts.std(axis=0), 1e-6)
+        feature_stats = {'mean': feature_mean, 'std': feature_std}
+        logger.info(f"  Normalization stats computed from {all_acts.shape[0]:,} positions "
+                    f"across {len(results)} regions")
+        del all_acts  # free memory
 
-    # Save stats to disk for reuse
-    stats_path = os.path.join(args.output_dir, 'data', 'feature_norm_stats.npz')
-    np.savez_compressed(stats_path, mean=feature_mean, std=feature_std)
-    logger.info(f"  Saved normalization stats to {stats_path}")
+        # Save stats to disk for reuse
+        stats_path = os.path.join(args.output_dir, 'data', 'feature_norm_stats.npz')
+        np.savez_compressed(stats_path, mean=feature_mean, std=feature_std)
+        logger.info(f"  Saved normalization stats to {stats_path}")
 
-    # -------------------------------------------------------------------------
-    # STEP 7: Find signature features
-    # -------------------------------------------------------------------------
-    logger.info("-" * 70)
-    logger.info("STEP 7: Finding signature features")
-    logger.info("-" * 70)
+        # ---------------------------------------------------------------------
+        # STEP 7: Find signature features
+        # ---------------------------------------------------------------------
+        logger.info("-" * 70)
+        logger.info("STEP 7: Finding signature features")
+        logger.info("-" * 70)
 
-    signatures = find_signature_features_across_regions(
-        results,
-        min_prevalence=args.signature_prevalence,
-    )
-    logger.info(f"Found {len(signatures)} signature features "
-                f"(prevalence >= {args.signature_prevalence:.0%})")
+        signatures = find_signature_features_across_regions(
+            results,
+            min_prevalence=args.signature_prevalence,
+        )
+        logger.info(f"Found {len(signatures)} signature features "
+                    f"(prevalence >= {args.signature_prevalence:.0%})")
 
-    for sig in signatures[:10]:
-        logger.info(f"  Feature {sig['feature_id']}: "
-                     f"prevalence={sig['prevalence']:.1%}, "
-                     f"mean_act={sig['mean_activation']:.3f}, "
-                     f"drops={sig['drop_count']}, rises={sig['rise_count']}")
+        for sig in signatures[:10]:
+            logger.info(f"  Feature {sig['feature_id']}: "
+                         f"prevalence={sig['prevalence']:.1%}, "
+                         f"mean_act={sig['mean_activation']:.3f}, "
+                         f"drops={sig['drop_count']}, rises={sig['rise_count']}")
 
-    # -------------------------------------------------------------------------
-    # STEP 8: Save data outputs
-    # -------------------------------------------------------------------------
-    logger.info("-" * 70)
-    logger.info("STEP 8: Saving results")
-    logger.info("-" * 70)
+        # ---------------------------------------------------------------------
+        # STEP 8: Save data outputs
+        # ---------------------------------------------------------------------
+        logger.info("-" * 70)
+        logger.info("STEP 8: Saving results")
+        logger.info("-" * 70)
 
-    save_results(results, signatures, args.output_dir, logger)
+        save_results(results, signatures, args.output_dir, logger)
 
     # -------------------------------------------------------------------------
     # STEP 9: Generate plots (notebook-style)
