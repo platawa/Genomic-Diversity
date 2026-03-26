@@ -18,12 +18,13 @@ GTF="/orcd/data/zhang_f/001/platawa/data/MEng_Thesis/ncbi_dataset_ecoli/ncbi_dat
 
 echo "[$(date)] Starting E. coli latent analysis and t-SNE plots..."
 
-# Step 1: Run latent analysis (recompute for fresh embeddings)
+# Step 1: Run latent analysis (recompute for fresh embeddings) with global normalization
 echo "[$(date)] Step 1/2: Computing latent embeddings and clusters..."
 python tools/analyze_sae_regions.py \
     --input_dir "${SAE_RUN}" \
     --embedding both \
     --leiden_resolution 0.5 \
+    --global_stats "results/NC_000913.3/sae_global_stats/20260317_232205_fused_minmax/data/global_sae_stats.npz" \
     2>&1 | tee logs/ecoli_latent_analysis.log
 
 # Step 2: Generate t-SNE plots with genomic annotation
