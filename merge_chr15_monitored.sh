@@ -48,9 +48,10 @@ START=\$(date +%s)
 echo '[Progress Monitor] Start time: '\$(date)
 echo '[Progress Monitor] PID: \$\$'
 
-# Run merge with background monitoring
+# Run merge with background monitoring to unique directory
 python merge_sae_shards.py --chrom ${CHROM} --n_shards ${N_SHARDS} --output_dir results/ &
 MERGE_PID=\$!
+echo '[Monitored] Output will be: results/chr15/sae/20260325_HHMMSS_all_conf8.0_merged*/'
 
 # Monitor progress every 10 seconds
 while kill -0 \$MERGE_PID 2>/dev/null; do
