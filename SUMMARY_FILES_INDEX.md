@@ -12,6 +12,7 @@
 | **PIPELINE_DECISION_MATRIX** | Choose conf≥8.0 vs conf≥0.0 pipeline | Below | Making decisions about which pipeline to run |
 | **COMPREHENSIVE_REPOSITORY_SUMMARY** | Complete inventory of all files and results | Below | Understanding what exists and where it is |
 | **COMPREHENSIVE_REPOSITORY_ARCHITECTURE_REVIEW** | Problems and restructuring recommendations | Below | Planning repository improvements |
+| **SIMPLIFICATION_PROPOSALS_SUPPLEMENT** | Additional simplification and UX recommendations | Below | Improving usability and reducing complexity |
 | **This file (SUMMARY_FILES_INDEX)** | Guide to all summary documents | Below | Navigating between all summaries |
 
 ---
@@ -24,6 +25,7 @@
 ├── PIPELINE_DECISION_MATRIX.md
 ├── COMPREHENSIVE_REPOSITORY_SUMMARY_2026-03-26.md
 ├── COMPREHENSIVE_REPOSITORY_ARCHITECTURE_REVIEW_2026-03-26.md
+├── SIMPLIFICATION_PROPOSALS_SUPPLEMENT.md
 └── SUMMARY_FILES_INDEX.md (this file)
 ```
 
@@ -33,6 +35,7 @@
 ├── PIPELINE_DECISION_MATRIX.md
 ├── COMPREHENSIVE_REPOSITORY_SUMMARY_2026-03-26.md
 ├── COMPREHENSIVE_REPOSITORY_ARCHITECTURE_REVIEW_2026-03-26.md
+├── SIMPLIFICATION_PROPOSALS_SUPPLEMENT.md
 └── SUMMARY_FILES_INDEX.md (this file)
 ```
 
@@ -259,6 +262,18 @@ grep -n "CRITICAL" COMPREHENSIVE_REPOSITORY_ARCHITECTURE_REVIEW_2026-03-26.md
 grep -n "Archive logs\|Consolidate\|Job naming" COMPREHENSIVE_REPOSITORY_ARCHITECTURE_REVIEW_2026-03-26.md
 ```
 
+### SIMPLIFICATION_PROPOSALS_SUPPLEMENT
+```bash
+# Find specific proposal
+grep -n "Proposal" SIMPLIFICATION_PROPOSALS_SUPPLEMENT.md
+
+# Find implementation roadmap
+grep -n "Phase 1\|Phase 2\|Phase 3" SIMPLIFICATION_PROPOSALS_SUPPLEMENT.md
+
+# Find priority ranking
+grep -n "NOW\|SOON\|LATER" SIMPLIFICATION_PROPOSALS_SUPPLEMENT.md
+```
+
 ---
 
 ## 📝 How These Documents Were Generated
@@ -295,6 +310,60 @@ All three documents were created through detailed analysis of:
 
 ---
 
+### 4. SIMPLIFICATION_PROPOSALS_SUPPLEMENT.md
+**515 lines | Last updated: 2026-03-26**
+
+**What it covers:**
+- 8 additional simplification proposals beyond the architectural review
+- Implementation roadmap (3 phases: quick wins, foundation, advanced)
+- Priority ranking for each proposal
+- Effort estimates and benefit analysis
+- Comparison to architectural review recommendations
+
+**When to read this:**
+- You want to improve user experience and reduce complexity
+- You're looking for "nice to have" improvements
+- You want a phased implementation plan
+- You're onboarding new users and finding the project confusing
+- You want to reduce cognitive overhead by 30-40%
+
+**Key sections:**
+- Lines 1-20: Executive summary
+- Lines 22-160: Proposals 1-8 (detailed descriptions and benefits)
+- Lines 162-220: Implementation roadmap (3 phases)
+- Lines 222-235: Priority ranking table
+- Lines 237-260: Comparison to architectural review
+- Lines 262-280: Impact assessment
+
+**The 8 Proposals:**
+1. **Results Manifest** (5h) - Single source of truth for all results
+2. **Tool Documentation** (3h) - README for all tools
+3. **Configuration File** (2h) - Single config.yaml for all paths
+4. **Script Naming** (4h) - Consistent naming convention
+5. **Pipeline State Machine** (4h) - Enforce valid job submission order
+6. **Archive Old Results** (2h) - Clean up inactive runs
+7. **Experiment Tracking** (4h) - Compare results across runs
+8. **START_HERE Guide** (2h) - Quick onboarding for new users
+
+**How to analyze:**
+1. Read executive summary (lines 1-20) for overview
+2. Check priority ranking table (lines 222-235)
+3. Look at Phase 1 "quick wins" (4-6 hours) for immediate impact
+4. Review implementation roadmap (lines 162-220) for sequencing
+5. Read individual proposals for details
+
+**Example uses:**
+- Q: "What should we fix first?"
+  A: See Phase 1 in implementation roadmap
+
+- Q: "How long will it take?"
+  A: See total effort (27 hours) and effort per proposal
+
+- Q: "Which is most important?"
+  A: See priority ranking table (🔴 NOW items)
+
+---
+
 ## 🚀 Next Steps Based on Summaries
 
 **Immediate (This Week):**
@@ -326,6 +395,7 @@ For specific topics, consult:
 - **"Which pipeline should I run?"** → PIPELINE_DECISION_MATRIX.md
 - **"Where is X file?"** → COMPREHENSIVE_REPOSITORY_SUMMARY_2026-03-26.md
 - **"How should we improve the repo?"** → COMPREHENSIVE_REPOSITORY_ARCHITECTURE_REVIEW_2026-03-26.md
+- **"What simplifications can we do?"** → SIMPLIFICATION_PROPOSALS_SUPPLEMENT.md
 - **"How do I use these summaries?"** → This file (SUMMARY_FILES_INDEX.md)
 
 ---
