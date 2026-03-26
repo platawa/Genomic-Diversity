@@ -1,0 +1,37 @@
+#!/bin/bash
+#SBATCH -J ecoli_latent_tsne
+#SBATCH -p pi_zhang_f
+#SBATCH -t 02:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH -o logs/ecoli_latent_tsne_%j.out
+#SBATCH -e logs/ecoli_latent_tsne_%j.err
+
+set -e
+
+module load miniforge/24.3.0-0
+conda activate evo2_sep28
+cd /orcd/data/zhang_f/001/platawa/jan31_files
+
+SAE_RUN="results/NC_000913.3/sae/20260309_132936_max50_conf3.0"
+GTF="/orcd/data/zhang_f/001/platawa/data/MEng_Thesis/ncbi_dataset_ecoli/ncbi_dataset/data/GCF_000005845.2/genomic.gtf"
+
+echo "[$(date)] Starting E. coli latent analysis and t-SNE plots..."
+
+# Step 1: Run latent analysis (recompute for fresh embeddings)
+echo "[$(date)] Step 1/2: Computing latent embeddings and clusters..."
+python tools/analyze_sae_regions.py \
+    --input_dir "${SAE_RUN}" \
+    --embedding both \
+    --leiden_resolution 0.5 \
+    2>&1 | tee logs/ecoli_latent_analysis.log
+
+# Step 2: Generate t-SNE plots with genomic annotation
+echo "[$(date)] Step 2/2: Generating annotated t-SNE plots..."
+python tools/plot_tsne_by_annotation.py \
+    --sae_run "${SAE_RUN}" \
+    --gtf "${GTF}" \
+    --chrom NC_000913.3 \
+    2>&1 | tee logs/ecoli_tsne_plots.log
+
+echo "[$(date)] E. coli latent analysis and t-SNE plots COMPLETED"
