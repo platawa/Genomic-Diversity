@@ -124,6 +124,12 @@ def parse_args():
     parser.add_argument("--global_stats", type=str, default=None,
                         help="Path to global_feature_stats.npz for z-score normalization "
                              "of pooled vectors before embedding")
+    parser.add_argument("--latent_subdir", type=str, default="latent_analysis",
+                        help="Subdirectory name under results/chrN/sae/ to read pooled vectors from "
+                             "(default: latent_analysis). Use latent_analysis_conf0 for conf0.0.")
+    parser.add_argument("--n_pca", type=int, default=0,
+                        help="Number of PCA components for dimensionality reduction before "
+                             "neighbor graph (0=disabled, 50 recommended for large datasets)")
     parser.add_argument("--log_level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
@@ -132,7 +138,7 @@ def parse_args():
 def plot_embedding(coords, labels, colors, order, title, xlabel, ylabel,
                    out_path, point_size=15, alpha=0.7):
     """Plot a 2D scatter colored by categorical labels."""
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(8, 6))
     for label in order:
         mask = np.array([l == label for l in labels])
         if mask.any():
@@ -153,7 +159,7 @@ def plot_annotation_and_confidence(coords, annotations, confidences,
                                    annotation_colors, annotation_order,
                                    title, xlabel, ylabel, out_path):
     """Side-by-side: annotation colors + confidence colormap."""
-    fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
     # Left: annotation
     ax = axes[0]
@@ -194,7 +200,7 @@ def plot_by_chromosome(coords, chrom_labels, title, xlabel, ylabel, out_path):
     cmap = plt.cm.get_cmap("tab20", len(unique_chroms))
     chrom_to_color = {c: cmap(i) for i, c in enumerate(unique_chroms)}
 
-    fig, ax = plt.subplots(figsize=(12, 8))
+    fig, ax = plt.subplots(figsize=(8, 6))
     for chrom in unique_chroms:
         mask = np.array([c == chrom for c in chrom_labels])
         ax.scatter(coords[mask, 0], coords[mask, 1],
@@ -218,7 +224,7 @@ def plot_single_annotation(coords, annotations, annotation_type, annotation_colo
         logger.warning(f"No regions with annotation '{annotation_type}'")
         return
 
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(8, 6))
     ax.scatter(coords[mask, 0], coords[mask, 1],
                c=annotation_colors.get(annotation_type, "#999999"),
                s=point_size, alpha=0.7, edgecolors="none")
@@ -239,7 +245,7 @@ def plot_by_method(coords, methods, title, xlabel, ylabel, out_path):
     }
     unique_methods = sorted(set(methods))
 
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(8, 6))
     for method in unique_methods:
         mask = np.array([m == method for m in methods])
         ax.scatter(coords[mask, 0], coords[mask, 1],
@@ -262,7 +268,7 @@ def plot_by_cluster(coords, clusters, title, xlabel, ylabel, out_path):
     cmap = plt.cm.get_cmap("tab20" if len(unique_clusters) <= 10 else "tab20b")
     cluster_colors = {c: cmap(i % 20) for i, c in enumerate(unique_clusters)}
 
-    fig, ax = plt.subplots(figsize=(12, 8))
+    fig, ax = plt.subplots(figsize=(8, 6))
     for c in unique_clusters:
         mask = clusters == c
         ax.scatter(coords[mask, 0], coords[mask, 1],
@@ -281,7 +287,7 @@ def plot_by_cluster(coords, clusters, title, xlabel, ylabel, out_path):
 def plot_continuous_colormaps(coords, confidences, region_lengths, title,
                                xlabel, ylabel, out_path):
     """Side-by-side: confidence and region length colormaps."""
-    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
     # Confidence
     ax = axes[0]
@@ -336,31 +342,104 @@ def main():
     logger.info(f"Chromosomes requested: {len(chroms)}")
     logger.info(f"Embedding: {args.embedding}")
 
+    # ── Check cache first before loading chromosomes ───────────────────────
+    cache_base = args.output_dir or os.path.join(results_dir, "_genome_wide", "sae_tsne")
+    os.makedirs(os.path.join(cache_base, "_cache"), exist_ok=True)
+    cache_suffix = "_normalized" if args.global_stats else "_raw"
+    combined_cache = os.path.join(cache_base, "_cache", f'combined_maxpooled{cache_suffix}.npy')
+    metadata_cache = os.path.join(cache_base, "_cache", f'combined_metadata{cache_suffix}.json')
+
+    skip_loading = False
+    if os.path.isfile(combined_cache) and os.path.isfile(metadata_cache):
+        logger.info(f"RESUME: Found cached combined vectors at {combined_cache}")
+        skip_loading = True
+
     # ── 1. Collect data across chromosomes ───────────────────────────────────
     all_vectors = []
     all_metadata = []
     source_inputs = {}
     chrom_region_counts = {}
 
-    for chrom in chroms:
+    latent_subdir = args.latent_subdir
+    latent_subdir_norm = latent_subdir + "_normalized" if not latent_subdir.endswith("_normalized") else latent_subdir
+
+    if not skip_loading:
+      for chrom in chroms:
+        # Try from_shards output first, then fall back to latest completed SAE run
+        from_shards_vectors = os.path.join(results_dir, chrom, "sae", latent_subdir, "data", "maxpooled_vectors.npy")
+        from_shards_norm = os.path.join(results_dir, chrom, "sae", latent_subdir_norm, "data", "maxpooled_vectors.npy")
+
         sae_run = find_latest_completed(results_dir, chrom, "sae")
-        if sae_run is None:
-            logger.warning(f"  {chrom}: no completed SAE run — skipping")
-            continue
+        vectors = None
+        results_tsv = None
 
-        logger.info(f"  {chrom}: {os.path.basename(sae_run)}")
+        # Helper: find deduplicated shard TSVs (newest COMPLETED per index)
+        def _find_deduped_shard_tsvs(sae_root):
+            import re as _re
+            shard_pat = _re.compile(r"shard(\d+)of(\d+)")
+            seen = {}
+            for entry in sorted(os.listdir(sae_root)):
+                if "merged" in entry:
+                    continue
+                m = shard_pat.search(entry)
+                if not m:
+                    continue
+                full = os.path.join(sae_root, entry)
+                if os.path.isfile(os.path.join(full, "COMPLETED")):
+                    tsv = os.path.join(full, "data", "sae_results.tsv")
+                    if os.path.isfile(tsv):
+                        idx = int(m.group(1))
+                        seen[idx] = tsv  # newest wins (sorted order)
+            return [seen[k] for k in sorted(seen.keys())]
 
-        vectors = load_maxpooled_vectors(sae_run)
+        sae_root = os.path.join(results_dir, chrom, "sae")
+
+        # Priority: from_shards normalized > from_shards raw > sae_run
+        if args.global_stats and os.path.isfile(from_shards_norm):
+            vectors = np.load(from_shards_norm)
+            logger.info(f"  {chrom}: loaded from_shards normalized ({vectors.shape})")
+            # Prefer cluster_assignments.tsv (already aligned with vectors)
+            ca_tsv = os.path.join(results_dir, chrom, "sae", latent_subdir_norm, "data", "cluster_assignments.tsv")
+            if os.path.isfile(ca_tsv):
+                results_tsv = ca_tsv
+            else:
+                shard_tsvs = _find_deduped_shard_tsvs(sae_root)
+                if shard_tsvs:
+                    results_tsv = shard_tsvs
+        elif os.path.isfile(from_shards_vectors):
+            vectors = np.load(from_shards_vectors)
+            logger.info(f"  {chrom}: loaded from_shards raw ({vectors.shape})")
+            # Prefer cluster_assignments.tsv (already aligned with vectors)
+            ca_tsv = os.path.join(results_dir, chrom, "sae", latent_subdir, "data", "cluster_assignments.tsv")
+            if os.path.isfile(ca_tsv):
+                results_tsv = ca_tsv
+            else:
+                shard_tsvs = _find_deduped_shard_tsvs(sae_root)
+                if shard_tsvs:
+                    results_tsv = shard_tsvs
+        elif sae_run is not None:
+            logger.info(f"  {chrom}: {os.path.basename(sae_run)}")
+            vectors = load_maxpooled_vectors(sae_run)
+            results_tsv = os.path.join(sae_run, "data", "sae_results.tsv")
+
         if vectors is None:
             logger.warning(f"  {chrom}: could not load feature vectors — skipping")
             continue
 
-        results_tsv = os.path.join(sae_run, "data", "sae_results.tsv")
-        if not os.path.isfile(results_tsv):
+        # Load metadata
+        if isinstance(results_tsv, list):
+            # Multiple shard TSVs
+            metadata = []
+            for tsv in results_tsv:
+                metadata.extend(load_region_metadata(tsv))
+            logger.info(f"  {chrom}: loaded metadata from {len(results_tsv)} shard TSVs ({len(metadata)} regions)")
+        elif results_tsv and os.path.isfile(results_tsv):
+            metadata = load_region_metadata(results_tsv, logger=logger)
+        else:
             logger.warning(f"  {chrom}: no sae_results.tsv — skipping")
             continue
 
-        metadata = load_region_metadata(results_tsv, logger=logger)
+        metadata = load_region_metadata(results_tsv, logger=logger) if not isinstance(results_tsv, list) else metadata
         if len(metadata) != vectors.shape[0]:
             logger.warning(
                 f"  {chrom}: metadata ({len(metadata)}) != vectors ({vectors.shape[0]}) "
@@ -387,38 +466,170 @@ def main():
         source_inputs[f"sae_{chrom}"] = sae_run
         chrom_region_counts[chrom] = len(metadata)
 
-    n_chroms = len(chrom_region_counts)
-    if n_chroms < 2:
-        logger.error(f"Only {n_chroms} chromosome(s) with SAE data — need at least 2.")
-        sys.exit(1)
+    if not skip_loading:
+        n_chroms = len(chrom_region_counts)
+        if n_chroms < 2:
+            logger.error(f"Only {n_chroms} chromosome(s) with SAE data — need at least 2.")
+            sys.exit(1)
 
-    combined = np.vstack(all_vectors)
-    n_total = combined.shape[0]
-    logger.info(f"\nCombined matrix: {combined.shape} from {n_chroms} chromosomes")
-    for chrom, cnt in chrom_region_counts.items():
-        logger.info(f"  {chrom}: {cnt} regions")
+    if skip_loading:
+        # Copy to local /tmp if on a cluster node (NFS → local SSD is 10-50x faster)
+        import shutil
+        local_tmp = os.path.join("/tmp", f"sae_cache_{os.getpid()}")
+        os.makedirs(local_tmp, exist_ok=True)
+        local_combined = os.path.join(local_tmp, os.path.basename(combined_cache))
+        if not os.path.isfile(local_combined):
+            file_size_gb = os.path.getsize(combined_cache) / (1024**3)
+            logger.info(f"RESUME: Copying {file_size_gb:.1f}GB to local /tmp for fast I/O...")
+            import time as _time
+            t0 = _time.time()
+            shutil.copy2(combined_cache, local_combined)
+            logger.info(f"  Copied in {_time.time()-t0:.0f}s")
+        else:
+            logger.info(f"RESUME: Using existing local copy at {local_combined}")
+        logger.info(f"RESUME: Loading combined vectors from local copy...")
+        combined = np.load(local_combined)
+        import json as _json
+        with open(metadata_cache) as f:
+            all_metadata = _json.load(f)
+        chrom_labels = [m.get('chrom', '?') for m in all_metadata]
+        n_total = combined.shape[0]
+        n_chroms = len(set(chrom_labels))
+        logger.info(f"  Loaded {n_total} vectors from {n_chroms} chromosomes")
+    else:
+        combined = np.vstack(all_vectors)
+        n_total = combined.shape[0]
+        logger.info(f"\nCombined matrix: {combined.shape} from {n_chroms} chromosomes")
+        for chrom, cnt in chrom_region_counts.items():
+            logger.info(f"  {chrom}: {cnt} regions")
 
-    # Optional: apply global z-score normalization
-    if args.global_stats:
-        logger.info(f"Applying genome-wide z-score normalization from {args.global_stats}")
-        gstats = dict(np.load(args.global_stats))
-        mean = gstats["mean"]
-        std = gstats["std"]
-        valid = gstats.get("valid_mask", std > 0)
-        normalized = np.zeros_like(combined)
-        normalized[:, valid] = (combined[:, valid] - mean[valid]) / std[valid]
-        combined = normalized
-        logger.info(f"  Normalized range: [{combined.min():.4f}, {combined.max():.4f}]")
+        # Optional: apply global z-score normalization
+        if args.global_stats:
+            logger.info(f"Applying genome-wide z-score normalization from {args.global_stats}")
+            gstats = dict(np.load(args.global_stats))
+            mean = gstats.get("mean", gstats.get("cross_chrom_mean"))
+            std = gstats.get("std", gstats.get("cross_chrom_std"))
+            valid = gstats.get("valid_mask", std > 0)
+            normalized = np.zeros_like(combined)
+            normalized[:, valid] = (combined[:, valid] - mean[valid]) / std[valid]
+            combined = normalized
+            logger.info(f"  Normalized range: [{combined.min():.4f}, {combined.max():.4f}]")
+
+        # Save checkpoint
+        logger.info(f"Saving combined vectors checkpoint to {combined_cache}")
+        np.save(combined_cache, combined)
+        import json as _json
+        with open(metadata_cache, 'w') as f:
+            _json.dump(all_metadata, f)
+        logger.info(f"  Saved {combined.shape} vectors + {len(all_metadata)} metadata entries")
 
     # ── 2. Compute embedding + clustering ────────────────────────────────────
-    logger.info(f"\nComputing {args.embedding} embedding + Leiden clustering...")
-    result = compute_embedding_and_clusters(
-        combined, all_metadata,
-        method=args.embedding,
-        leiden_resolution=args.leiden_resolution,
-        logger=logger,
-    )
+    # Check for PCA / neighbor graph cache (must be defined before use below)
+    pca_suffix = f"_pca{args.n_pca}" if args.n_pca > 0 else ""
+
+    # Check for cached embeddings
+    cached_clusters = os.path.join(cache_base, "_cache", f"cluster_assignments{cache_suffix}{pca_suffix}.npy")
+    cached_umap = os.path.join(cache_base, "_cache", f"embedding_umap{cache_suffix}.npy")
+    cached_tsne = os.path.join(cache_base, "_cache", f"embedding_tsne{cache_suffix}.npy")
+
+    # Check which embeddings are needed vs cached
+    need_umap = args.embedding in ("umap", "both")
+    need_tsne = args.embedding in ("tsne", "both")
+    have_umap = os.path.isfile(cached_umap)
+    have_tsne = os.path.isfile(cached_tsne)
+    have_clusters = os.path.isfile(cached_clusters)
+    cached_pca = os.path.join(cache_base, "_cache", f"pca_vectors{cache_suffix}{pca_suffix}.npy")
+    cached_neighbors = os.path.join(cache_base, "_cache", f"neighbors{cache_suffix}{pca_suffix}.h5ad")
+
+    all_cached = have_clusters and (not need_umap or have_umap) and (not need_tsne or have_tsne)
+
+    if all_cached:
+        logger.info("RESUME: Loading cached embeddings + clusters (all requested embeddings found)")
+        result = {
+            'cluster_assignments': np.load(cached_clusters),
+            'n_clusters': len(np.unique(np.load(cached_clusters))),
+            'embedding_umap': np.load(cached_umap) if have_umap else None,
+            'embedding_tsne': np.load(cached_tsne) if have_tsne else None,
+        }
+        logger.info(f"  Clusters: {result['n_clusters']}, UMAP: {result['embedding_umap'] is not None}, t-SNE: {result['embedding_tsne'] is not None}")
+    else:
+        # Check if we can resume from cached PCA/neighbors
+        if os.path.isfile(cached_pca) and os.path.isfile(cached_neighbors):
+            logger.info(f"RESUME: Loading cached PCA vectors + neighbor graph")
+            import scanpy as sc
+            import anndata
+            pca_vectors = np.load(cached_pca)
+            adata = sc.read_h5ad(cached_neighbors)
+            logger.info(f"  PCA: {pca_vectors.shape}, neighbors loaded")
+
+            # Only compute missing embeddings
+            result = {}
+            if have_clusters:
+                result['cluster_assignments'] = np.load(cached_clusters)
+            else:
+                sc.tl.leiden(adata, resolution=args.leiden_resolution, random_state=42)
+                result['cluster_assignments'] = adata.obs['leiden'].astype(int).values
+
+            result['n_clusters'] = len(np.unique(result['cluster_assignments']))
+
+            if need_umap and have_umap:
+                result['embedding_umap'] = np.load(cached_umap)
+                logger.info("  Loaded cached UMAP")
+            elif need_umap:
+                logger.info("  Computing UMAP from cached neighbors...")
+                sc.tl.umap(adata, random_state=42)
+                result['embedding_umap'] = adata.obsm['X_umap'].copy()
+                logger.info("  UMAP done")
+            else:
+                result['embedding_umap'] = None
+
+            if need_tsne and have_tsne:
+                result['embedding_tsne'] = np.load(cached_tsne)
+                logger.info("  Loaded cached t-SNE")
+            elif need_tsne:
+                logger.info("  Computing t-SNE from cached PCA vectors...")
+                sc.tl.tsne(adata, random_state=42, use_rep='X_pca' if 'X_pca' in adata.obsm else 'X', n_jobs=-1)
+                result['embedding_tsne'] = adata.obsm['X_tsne'].copy()
+                logger.info("  t-SNE done")
+            else:
+                result['embedding_tsne'] = None
+        else:
+            logger.info(f"\nComputing {args.embedding} embedding + Leiden clustering...")
+            cache_data_dir = os.path.join(cache_base, "_cache")
+            result = compute_embedding_and_clusters(
+                combined, all_metadata,
+                method=args.embedding,
+                leiden_resolution=args.leiden_resolution,
+                logger=logger,
+                checkpoint_dir=cache_data_dir,
+                n_pca_components=args.n_pca,
+            )
+            # Rename PCA/neighbor checkpoints to include suffix
+            for src_name, dst_name in [
+                ("pca_vectors.npy", f"pca_vectors{cache_suffix}{pca_suffix}.npy"),
+                ("neighbors.h5ad", f"neighbors{cache_suffix}{pca_suffix}.h5ad"),
+            ]:
+                src = os.path.join(cache_data_dir, src_name)
+                dst = os.path.join(cache_data_dir, dst_name)
+                if os.path.isfile(src) and src != dst:
+                    os.rename(src, dst)
+                    logger.info(f"  Renamed {src_name} → {dst_name}")
     logger.info(f"Clustering found {result['n_clusters']} clusters")
+
+    # Save embeddings + clusters immediately (before GTF parsing and plotting)
+    cache_data_dir = os.path.join(cache_base, "_cache")
+    logger.info(f"Saving embedding checkpoints to {cache_data_dir}/")
+    np.save(os.path.join(cache_data_dir, f"cluster_assignments{cache_suffix}{pca_suffix}.npy"),
+            result["cluster_assignments"])
+    if result.get("embedding_umap") is not None:
+        np.save(os.path.join(cache_data_dir, f"embedding_umap{cache_suffix}.npy"),
+                result["embedding_umap"])
+        logger.info(f"  Saved UMAP embedding ({result['embedding_umap'].shape})")
+    if result.get("embedding_tsne") is not None:
+        np.save(os.path.join(cache_data_dir, f"embedding_tsne{cache_suffix}.npy"),
+                result["embedding_tsne"])
+        logger.info(f"  Saved t-SNE embedding ({result['embedding_tsne'].shape})")
+    logger.info(f"  Saved cluster assignments ({result['n_clusters']} clusters)")
 
     # ── 3. GTF annotation ────────────────────────────────────────────────────
     logger.info(f"\nClassifying regions by GTF annotation...")

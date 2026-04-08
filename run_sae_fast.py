@@ -1962,6 +1962,9 @@ Examples:
     # Output
     parser.add_argument("--output_dir", type=str, default="./results",
                         help="Root results directory (default: ./results)")
+    parser.add_argument("--resume_dir", type=str, default=None,
+                        help="Resume from an existing run directory. Skips creating a new "
+                             "timestamped directory and reads checkpoints from the existing one.")
     parser.add_argument("--auto", action="store_true",
                         help="Auto-discover latest COMPLETED scoring run for --chrom. "
                              "Makes --boundaries and --entropy optional.")
@@ -2062,8 +2065,13 @@ Examples:
         desc_parts.append(f"shard{shard_idx}of{n_shards}")
     descriptor = "_".join(desc_parts)
 
-    run_dir = build_run_dir(args.output_dir, args.chrom, "sae", descriptor)
-    args.output_dir = run_dir
+    if args.resume_dir:
+        run_dir = os.path.abspath(args.resume_dir)
+        args.output_dir = run_dir
+        logger.info(f"RESUME: Using existing directory {run_dir}")
+    else:
+        run_dir = build_run_dir(args.output_dir, args.chrom, "sae", descriptor)
+        args.output_dir = run_dir
     os.makedirs(os.path.join(run_dir, 'data'), exist_ok=True)
     os.makedirs(os.path.join(run_dir, 'plots'), exist_ok=True)
 

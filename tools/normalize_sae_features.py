@@ -47,10 +47,21 @@ def setup_logging(level="INFO"):
 
 
 def normalize_zscore(vectors, stats):
-    """Z-score normalization: (x - mean) / std."""
-    mean = stats["mean"]
-    std = stats["std"]
-    valid = stats["valid_mask"]
+    """Z-score normalization: (x - mean) / std.
+
+    Uses per-nucleotide genome-wide stats (nuc_mean/nuc_std) if available,
+    falling back to region-max-pool stats (mean/std) otherwise.
+    """
+    if "nuc_mean" in stats and "nuc_std" in stats:
+        mean = stats["nuc_mean"]
+        std = stats["nuc_std"]
+        valid = std > 0
+        logger.info("Using per-nucleotide genome-wide stats for z-score")
+    else:
+        mean = stats["mean"]
+        std = stats["std"]
+        valid = stats["valid_mask"]
+        logger.info("Using region-max-pool stats for z-score (nuc stats not available)")
 
     normalized = np.zeros_like(vectors)
     normalized[:, valid] = (vectors[:, valid] - mean[valid]) / std[valid]
@@ -128,8 +139,13 @@ def main():
         parser.error("Specify --stats_file or --auto")
 
     if not os.path.isfile(stats_path):
-        logger.error(f"Stats file not found: {stats_path}")
-        sys.exit(1)
+        # Also try genome_wide_sae_stats_corrected.npz in same dir
+        alt_path = os.path.join(os.path.dirname(stats_path), "genome_wide_sae_stats_corrected.npz")
+        if os.path.isfile(alt_path):
+            stats_path = alt_path
+        else:
+            logger.error(f"Stats file not found: {stats_path}")
+            sys.exit(1)
 
     logger.info(f"Global stats: {stats_path}")
     stats = dict(np.load(stats_path))

@@ -93,6 +93,17 @@ def find_shard_dirs(output_dir: str, chrom: str, n_shards: int | None = None,
         sys.exit(1)
 
     dirs.sort(key=lambda x: x[0])
+
+    # Deduplicate: when multiple dirs exist for the same shard index,
+    # keep only the newest (last in sorted order, since entries are
+    # lexicographically sorted by timestamp prefix).
+    seen: dict[int, tuple] = {}
+    for entry in dirs:
+        shard_idx = entry[0]
+        # Later entries have newer timestamps; always overwrite
+        seen[shard_idx] = entry
+    dirs = sorted(seen.values(), key=lambda x: x[0])
+
     return dirs
 
 
@@ -139,17 +150,25 @@ def merge_feature_matrices(shard_dirs: list[tuple], out_path: str) -> dict:
     """
     import zipfile
     import io
+    import tempfile
+    import shutil
     from numpy.lib.format import write_array
 
+    # Write to temporary file first, then rename for atomicity on NFS
+    temp_path = out_path + '.tmp'
     region_offset = 0
-    with zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_STORED) as zf:
+    with zipfile.ZipFile(temp_path, 'w', compression=zipfile.ZIP_STORED) as zf:
         for entry in shard_dirs:
             shard_idx, _, shard_dir = entry[0], entry[1], entry[2]
             chunk_files = _find_chunk_files(shard_dir)
             if chunk_files:
                 n_in_shard = 0
                 for cf in chunk_files:
-                    data = np.load(cf)
+                    try:
+                        data = np.load(cf)
+                    except (zipfile.BadZipFile, Exception) as e:
+                        print(f"  WARNING: skipping corrupted chunk {cf}: {e}")
+                        continue
                     for key in sorted(data.files, key=lambda x: int(x.split('_')[1])):
                         orig_idx = int(key.split('_')[1])
                         new_key = f'region_{region_offset + orig_idx}'
@@ -167,7 +186,11 @@ def merge_feature_matrices(shard_dirs: list[tuple], out_path: str) -> dict:
                 if not os.path.isfile(chk):
                     print(f"  WARNING: no chunk/checkpoint data found for shard {shard_idx} (skipping)")
                     continue
-                data = np.load(chk)
+                try:
+                    data = np.load(chk)
+                except (zipfile.BadZipFile, Exception) as e:
+                    print(f"  WARNING: skipping corrupted checkpoint {chk}: {e}")
+                    continue
                 n_in_shard = 0
                 for key in sorted(data.files):
                     orig_idx = int(key.split('_')[1])
@@ -181,6 +204,10 @@ def merge_feature_matrices(shard_dirs: list[tuple], out_path: str) -> dict:
                 data.close()
                 region_offset += n_in_shard
                 print(f"  Shard {shard_idx}: {n_in_shard} regions (offset now {region_offset})")
+
+    # Context manager has closed zf; now rename temp file to final location
+    # This ensures the file is complete before the final name is visible
+    shutil.move(temp_path, out_path)
 
     print(f"  Merged feature matrices (uncompressed) → {out_path}  ({region_offset} total regions)")
     return {'total_regions': region_offset}
@@ -261,6 +288,8 @@ def main():
     parser.add_argument("--after", type=str, default=None,
                         help="Only use shard dirs with timestamp >= this value "
                              "(e.g. 20260322_2135). Filters out old failed runs.")
+    parser.add_argument("--skip-norm-stats", action="store_true",
+                        help="Skip normalization stats computation (allows finish_merges.py to add global stats)")
     args = parser.parse_args()
 
     output_dir = args.output_dir.rstrip('/')
@@ -312,11 +341,14 @@ def main():
     )
 
     # Compute normalization stats using streaming (low memory)
-    print("\nComputing normalization stats (streaming)...")
-    compute_norm_stats_streaming(
-        shard_dirs,
-        os.path.join(run_dir, 'data', 'feature_norm_stats.npz')
-    )
+    if not args.skip_norm_stats:
+        print("\nComputing normalization stats (streaming)...")
+        compute_norm_stats_streaming(
+            shard_dirs,
+            os.path.join(run_dir, 'data', 'feature_norm_stats.npz')
+        )
+    else:
+        print("\nSkipping normalization stats (will be added by finish_merges.py)")
 
     # Write source.json pointing to all shard dirs
     source = {f"shard_{s[0]}": {
@@ -339,9 +371,12 @@ def main():
     with open(os.path.join(run_dir, 'data', 'run_metadata.json'), 'w') as f:
         json.dump(meta, f, indent=2)
 
-    # Mark completed
+    # Mark completed (unless skipping norm stats)
     _wall_time = _time.time() - _wall_start
-    write_completed(run_dir, script_name='merge_sae_shards_fast.py', wall_time_s=_wall_time)
+    if not args.skip_norm_stats:
+        write_completed(run_dir, script_name='merge_sae_shards_fast.py', wall_time_s=_wall_time)
+    else:
+        print("\nSkipping COMPLETED sentinel — finish_merges.py will write it after adding norm stats")
     print(f"\nDone. Merged output: {run_dir}")
 
 

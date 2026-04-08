@@ -107,7 +107,8 @@ def detect_stage(run_dir: str) -> str:
 def replot_sae(run_dir: str, output_dir: str, logger: logging.Logger,
                normalize: str = 'zscore', n_plot_regions: int = 50,
                n_plot_features: int = 8, entropy_path: str = None,
-               gtf_path: str = None, chrom: str = None):
+               gtf_path: str = None, chrom: str = None,
+               global_stats_path: str = None):
     """Replot SAE feature analysis from saved data.
 
     Args:
@@ -184,13 +185,22 @@ def replot_sae(run_dir: str, output_dir: str, logger: logging.Logger,
     logger.info("Plotted feature_prevalence_by_method.png")
 
     # ── Per-region normalized feature plots ──────────────────────────────────
+    # Prefer pre-normalized matrices (genome-wide z-scored) if available
+    normalized_path = os.path.join(data_dir, 'feature_matrices_normalized.npz')
     matrices_path = os.path.join(data_dir, 'feature_matrices.npz')
-    if not os.path.exists(matrices_path):
+    use_prenormalized = False
+
+    if not global_stats_path and os.path.exists(normalized_path):
+        logger.info(f"Using pre-normalized (genome-wide z-scored) matrices: {normalized_path}")
+        mat_data = np.load(normalized_path)
+        use_prenormalized = True
+    elif os.path.exists(matrices_path):
+        logger.info(f"Loading feature matrices from {matrices_path}")
+        mat_data = np.load(matrices_path)
+    else:
         logger.warning(f"feature_matrices.npz not found at {matrices_path}, skipping per-region plots")
         return
 
-    logger.info(f"Loading feature matrices from {matrices_path}")
-    mat_data = np.load(matrices_path)
     n_regions = len(results)
     feature_matrices = []
     for i in range(n_regions):
@@ -200,20 +210,39 @@ def replot_sae(run_dir: str, output_dir: str, logger: logging.Logger,
         else:
             feature_matrices.append(None)
 
-    # Compute normalization stats from ALL regions (chromosome-level proxy)
+    # Compute normalization stats
     valid_mats = [m for m in feature_matrices if m is not None]
     if not valid_mats:
         logger.warning("No valid feature matrices found")
         return
 
-    all_acts = np.concatenate(valid_mats, axis=0)  # (total_positions, 32768)
-    feat_mean = all_acts.mean(axis=0)
-    feat_std = np.maximum(all_acts.std(axis=0), 1e-6)
-    feat_min = all_acts.min(axis=0)
-    feat_max = all_acts.max(axis=0)
-    feat_span = np.maximum(feat_max - feat_min, 1e-6)
-    del all_acts
-    logger.info(f"Computed normalization stats from {len(valid_mats)} regions")
+    if use_prenormalized:
+        # Data is already z-scored with genome-wide nuc_mean/nuc_std
+        # Use identity stats so zscore normalization is a no-op
+        feat_mean = np.zeros(valid_mats[0].shape[1], dtype=np.float32)
+        feat_std = np.ones(valid_mats[0].shape[1], dtype=np.float32)
+        feat_min = np.concatenate(valid_mats, axis=0).min(axis=0)
+        feat_max = np.concatenate(valid_mats, axis=0).max(axis=0)
+        feat_span = np.maximum(feat_max - feat_min, 1e-6)
+        logger.info("Pre-normalized data: z-score will pass through, minmax uses z-score range")
+    elif global_stats_path:
+        from results_utils import load_global_stats
+        gstats = load_global_stats(global_stats_path)
+        feat_mean = gstats['mean']
+        feat_std  = gstats['std']
+        feat_min  = gstats['min']
+        feat_max  = gstats['max']
+        feat_span = np.maximum(feat_max - feat_min, 1e-6)
+        logger.info(f"Using genome-wide normalization stats: {global_stats_path}")
+    else:
+        all_acts = np.concatenate(valid_mats, axis=0)  # (total_positions, 32768)
+        feat_mean = all_acts.mean(axis=0)
+        feat_std = np.maximum(all_acts.std(axis=0), 1e-6)
+        feat_min = all_acts.min(axis=0)
+        feat_max = all_acts.max(axis=0)
+        feat_span = np.maximum(feat_max - feat_min, 1e-6)
+        del all_acts
+        logger.info(f"Computed chromosome-local normalization stats from {len(valid_mats)} regions")
 
     # Save stats
     np.savez_compressed(os.path.join(data_dir, 'feature_norm_stats.npz'),
@@ -704,6 +733,10 @@ def parse_args():
                         help='Number of features to show per region plot. Default: 8')
     parser.add_argument('--entropy', default=None,
                         help='Path to entropy .npz file for entropy panel overlay (sae stage)')
+    parser.add_argument('--global_stats', default=None,
+                        help='Path to genome_wide_sae_stats.npz (from scan_sae_global_stats.py '
+                             '--aggregate) or global_feature_stats.npz. When set, uses genome-wide '
+                             'mean/std for z-score normalization instead of chromosome-local stats.')
     parser.add_argument('--log_level', default='INFO', help='Logging level')
     return parser.parse_args()
 
@@ -742,7 +775,8 @@ def main():
                    n_plot_features=args.n_plot_features,
                    entropy_path=args.entropy,
                    gtf_path=args.gtf,
-                   chrom=args.chrom)
+                   chrom=args.chrom,
+                   global_stats_path=args.global_stats)
     elif stage == 'sae_with_latent':
         replot_sae(run_dir, output_dir, logger,
                    normalize=args.normalize,
@@ -750,7 +784,8 @@ def main():
                    n_plot_features=args.n_plot_features,
                    entropy_path=args.entropy,
                    gtf_path=args.gtf,
-                   chrom=args.chrom)
+                   chrom=args.chrom,
+                   global_stats_path=args.global_stats)
         replot_latent_analysis(run_dir, output_dir, logger,
                                use_normalized=args.use_normalized)
     elif stage == 'sae_differential':

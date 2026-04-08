@@ -55,3 +55,16 @@ slurm-*.out
 archive/failed_runs/
 archive/outputs_single_gene/
 archive/logs_old/
+
+# Local plot images (large PNGs, regenerable)
+*.png
+tsne_plots_local/
+tsne_by_annotation_collection/
+crispr_plots/
+
+# Test artifacts
+results_test/
+npz_test_results.txt
+
+# Patch files
+*.patch

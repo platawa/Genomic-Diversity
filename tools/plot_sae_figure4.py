@@ -169,6 +169,7 @@ def plot_figure4c(
     output_path="figure4c.png",
     chrom="",
     figsize_width=30,
+    feature_norm_stats=None,
 ):
     """Create a Figure 4g-style stacked SAE feature activation plot.
 
@@ -250,9 +251,14 @@ def plot_figure4c(
                     exon_regions.append((s, e))
 
     # ── Feature trace panels (filled area style) ──
+    normalized = feature_norm_stats is not None
     for i, fid in enumerate(feature_ids):
         ax = axes[i]
         trace = feature_matrix[:, fid]
+
+        # Apply genome-wide z-score normalization if stats provided
+        if normalized:
+            trace = (trace - feature_norm_stats['mean'][fid]) / feature_norm_stats['std'][fid]
 
         # Gray exon/CDS shading behind traces
         for s, e in exon_regions:
@@ -263,9 +269,15 @@ def plot_figure4c(
                          edgecolor=line_color, linewidth=line_width)
 
         # Auto y-limit based on data
-        ymax = max(np.percentile(trace[trace > 0], 99) if np.any(trace > 0) else 3, 3)
-        ax.set_ylim([0, ymax])
-        ax.set_yticks([0, int(ymax)])
+        if normalized:
+            ymax = max(np.percentile(np.abs(trace), 99) if len(trace) > 0 else 3.0, 2.0)
+            ax.set_ylim([-ymax, ymax])
+            ax.set_yticks([-2, 0, 2])
+            ax.axhline(0, color='#aaaaaa', lw=0.4, zorder=0)
+        else:
+            ymax = max(np.percentile(trace[trace > 0], 99) if np.any(trace > 0) else 3, 3)
+            ax.set_ylim([0, ymax])
+            ax.set_yticks([0, int(ymax)])
 
         # Label: orange for known bio features, gray for others
         is_bio = fid in KNOWN_BIO_FEATURES
@@ -282,7 +294,8 @@ def plot_figure4c(
         # "Feature activations" on right side of middle panel
         if i == n_features // 2:
             ax2 = ax.twinx()
-            ax2.set_ylabel("Feature activations", fontsize=10, rotation=270,
+            ylabel = "Feature activations (z-scored)" if normalized else "Feature activations"
+            ax2.set_ylabel(ylabel, fontsize=10, rotation=270,
                            labelpad=15, color='#555555')
             ax2.set_yticks([])
 
@@ -437,6 +450,9 @@ def main():
     parser.add_argument("--figsize_width", type=int, default=40,
                         help="Figure width in inches (default: 40)")
 
+    parser.add_argument("--global_stats", type=str, default=None,
+                        help="Path to genome_wide_sae_stats.npz or global_feature_stats.npz. "
+                             "When set, normalizes each feature trace to genome-wide z-score scale.")
     parser.add_argument("--log_level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
@@ -559,6 +575,14 @@ def main():
         entropy_start = int(ent_data.get('start', 0))
         logger.info(f"Loaded entropy: {len(entropy):,} positions, start={entropy_start:,}")
 
+    # ── Load global normalization stats (optional) ──
+    feature_norm_stats = None
+    if args.global_stats:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from results_utils import load_global_stats
+        feature_norm_stats = load_global_stats(args.global_stats)
+        logger.info(f"Loaded genome-wide normalization stats: {args.global_stats}")
+
     # ── Generate plot ──
     window_kb = (args.window_end - args.window_start) // 1000
     output_name = f"figure4c_{args.chrom}_{args.window_start}_{args.window_end}.png"
@@ -575,6 +599,7 @@ def main():
         output_path=output_path,
         chrom=args.chrom,
         figsize_width=args.figsize_width,
+        feature_norm_stats=feature_norm_stats,
     )
 
     # Write COMPLETED sentinel

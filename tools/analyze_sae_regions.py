@@ -146,9 +146,11 @@ def load_and_pool_feature_matrices(
     """
     Load feature matrices from NPZ and pool each region on-the-fly.
 
-    Memory-efficient: loads one region at a time, pools it, then discards
-    the full matrix before loading the next. This avoids holding all
-    ~10GB of raw matrices in memory simultaneously.
+    Truly streaming: reads each region directly from the ZIP file using
+    zipfile + numpy.lib.format.read_array, pools it, and discards it
+    immediately. Unlike np.load() which caches every array in memory,
+    this keeps peak RAM at ~pooled output + one region (~4GB + ~100MB)
+    regardless of NPZ file size (works for multi-TB files).
 
     Args:
         npz_path: Path to feature_matrices.npz (keys: region_0, region_1, ...)
@@ -160,18 +162,26 @@ def load_and_pool_feature_matrices(
         - pooled_vectors: (N, 32768) array of pooled fingerprints
         - n_regions: Number of regions loaded
     """
+    import zipfile
+    import io
+    from numpy.lib.format import read_array
+
     if logger:
         logger.info(f"Loading feature matrices from {npz_path}")
 
-    data = np.load(npz_path, allow_pickle=True)
+    zf = zipfile.ZipFile(npz_path, 'r')
     keys = sorted(
-        [k for k in data.files if k.startswith('region_')],
-        key=lambda k: int(k.split('_')[1])
+        [k for k in zf.namelist() if k.startswith('region_')],
+        key=lambda k: int(k.rstrip('.npy').split('_')[1])
     )
 
     n_regions = len(keys)
     if n_regions == 0:
+        zf.close()
         raise ValueError(f"No region_* keys found in {npz_path}")
+
+    if logger:
+        logger.info(f"Found {n_regions} regions, streaming {pool_method}-pool...")
 
     pool_fn = np.max if pool_method == "max" else np.mean
 
@@ -179,21 +189,24 @@ def load_and_pool_feature_matrices(
     sparsity_stats = []
 
     for i, key in enumerate(keys):
-        feature_ts = data[key]  # shape: (seq_len, 32768)
+        raw = zf.read(key)
+        feature_ts = read_array(io.BytesIO(raw))  # shape: (seq_len, 32768)
+        del raw
+
         pooled = pool_fn(feature_ts, axis=0).astype(np.float32)
+        del feature_ts
         pooled_vectors[i] = pooled
 
         n_nonzero = np.count_nonzero(pooled)
         sparsity_stats.append(n_nonzero)
 
-        if logger and (i < 3 or i == n_regions - 1):
-            logger.debug(
-                f"  Region {i}: {feature_ts.shape[0]} positions, "
-                f"{n_nonzero}/{N_SAE_FEATURES} nonzero after {pool_method}-pool "
-                f"({n_nonzero/N_SAE_FEATURES:.1%})"
+        if logger and (i % 5000 == 0 or i == n_regions - 1):
+            logger.info(
+                f"  Pooled {i+1}/{n_regions} regions "
+                f"({(i+1)/n_regions:.0%})"
             )
 
-    data.close()
+    zf.close()
 
     if logger:
         mean_nnz = np.mean(sparsity_stats)
@@ -203,6 +216,163 @@ def load_and_pool_feature_matrices(
         )
 
     return pooled_vectors, n_regions
+
+
+def load_and_pool_from_shards(
+    results_dir: str,
+    chrom: str,
+    pool_method: str = "max",
+    n_shards: int = 36,
+    logger: logging.Logger = None,
+) -> Tuple[np.ndarray, int, List[str]]:
+    """
+    Load and pool feature matrices directly from shard directories,
+    bypassing the merged NPZ entirely.
+
+    Iterates shards 0→N in order, reads chunk files within each shard
+    sequentially, pools each region, and discards immediately. Produces
+    the same output as load_and_pool_feature_matrices() on a merged NPZ.
+
+    Also collects sae_results.tsv paths for downstream metadata loading.
+
+    Args:
+        results_dir: Root results directory (e.g. "results/")
+        chrom: Chromosome name (e.g. "chr22")
+        pool_method: "max" or "mean"
+        n_shards: Expected number of shards (default: 36)
+        logger: Optional logger
+
+    Returns:
+        Tuple of:
+        - pooled_vectors: (N, 32768) array of pooled fingerprints
+        - n_regions: Number of regions loaded
+        - tsv_paths: List of sae_results.tsv paths from each shard
+    """
+    import zipfile
+    import io
+    import re
+    import glob
+    from numpy.lib.format import read_array
+
+    # --- Discover shard directories (reuse logic from merge_sae_shards_fast.py) ---
+    sae_root = os.path.join(results_dir, chrom, "sae")
+    if not os.path.isdir(sae_root):
+        raise FileNotFoundError(f"SAE directory not found: {sae_root}")
+
+    shard_pattern = re.compile(r"shard(\d+)of(\d+)")
+    shard_dirs = []  # (idx, path)
+    for entry in sorted(os.listdir(sae_root)):
+        if "merged" in entry:
+            continue
+        m = shard_pattern.search(entry)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        total = int(m.group(2))
+        if total != n_shards:
+            continue
+        full = os.path.join(sae_root, entry)
+        if os.path.isfile(os.path.join(full, "COMPLETED")):
+            shard_dirs.append((idx, full))
+
+    # Deduplicate: keep newest (last in sorted order) per index
+    seen = {}
+    for idx, path in shard_dirs:
+        seen[idx] = path
+    shard_dirs = sorted(seen.items())
+
+    if not shard_dirs:
+        raise FileNotFoundError(f"No COMPLETED shard directories found in {sae_root}")
+
+    if logger:
+        logger.info(f"Found {len(shard_dirs)}/{n_shards} completed shards in {sae_root}")
+
+    # --- First pass: count total regions ---
+    total_regions = 0
+    for idx, path in shard_dirs:
+        meta_path = os.path.join(path, "data", "_checkpoint_meta.json")
+        if os.path.isfile(meta_path):
+            import json
+            with open(meta_path) as f:
+                meta = json.load(f)
+            total_regions += meta.get("n_done", 0)
+
+    if total_regions == 0:
+        raise ValueError(f"No regions found across {len(shard_dirs)} shards")
+
+    if logger:
+        logger.info(f"Total regions across shards: {total_regions}. Streaming {pool_method}-pool...")
+
+    # --- Second pass: stream, pool, discard ---
+    pool_fn = np.max if pool_method == "max" else np.mean
+    pooled_vectors = np.zeros((total_regions, N_SAE_FEATURES), dtype=np.float32)
+    sparsity_stats = []
+    tsv_paths = []
+    region_offset = 0
+
+    for shard_idx, shard_path in shard_dirs:
+        data_dir = os.path.join(shard_path, "data")
+
+        # Collect TSV path
+        tsv = os.path.join(data_dir, "sae_results.tsv")
+        if os.path.isfile(tsv):
+            tsv_paths.append(tsv)
+
+        # Find chunk files sorted by start index
+        chunk_files = sorted(
+            glob.glob(os.path.join(data_dir, "_chunk_*.npz")),
+            key=lambda p: int(os.path.basename(p).replace(".npz", "").split("_")[2])
+        )
+
+        for cf in chunk_files:
+            try:
+                zf = zipfile.ZipFile(cf, 'r')
+            except (zipfile.BadZipFile, Exception) as e:
+                if logger:
+                    logger.warning(f"Skipping corrupted chunk {cf}: {e}")
+                continue
+
+            keys = sorted(
+                zf.namelist(),
+                key=lambda k: int(k.rstrip('.npy').split('_')[1])
+            )
+
+            for key in keys:
+                raw = zf.read(key)
+                feature_ts = read_array(io.BytesIO(raw))
+                del raw
+
+                pooled = pool_fn(feature_ts, axis=0).astype(np.float32)
+                del feature_ts
+
+                if region_offset < total_regions:
+                    pooled_vectors[region_offset] = pooled
+                    sparsity_stats.append(np.count_nonzero(pooled))
+                    region_offset += 1
+
+            zf.close()
+
+        if logger and (shard_idx % 6 == 0 or shard_idx == shard_dirs[-1][0]):
+            logger.info(
+                f"  Shard {shard_idx}: {region_offset}/{total_regions} regions pooled "
+                f"({region_offset/total_regions:.0%})"
+            )
+
+    # Trim if we got fewer than expected
+    if region_offset < total_regions:
+        pooled_vectors = pooled_vectors[:region_offset]
+        if logger:
+            logger.warning(f"Expected {total_regions} regions but got {region_offset}")
+
+    if logger:
+        mean_nnz = np.mean(sparsity_stats) if sparsity_stats else 0
+        logger.info(
+            f"Loaded {region_offset} regions from {len(shard_dirs)} shards, "
+            f"{pool_method}-pooled to ({region_offset}, {N_SAE_FEATURES}). "
+            f"Mean nonzero: {mean_nnz:.0f}/{N_SAE_FEATURES} ({mean_nnz/N_SAE_FEATURES:.1%})"
+        )
+
+    return pooled_vectors, region_offset, tsv_paths
 
 
 def load_region_metadata(
@@ -229,22 +399,36 @@ def load_region_metadata(
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-            # Skip header
-            if line.startswith('region_idx'):
+            # Skip headers for both formats
+            if line.startswith('region_idx') or line.startswith('region_id'):
                 continue
 
             parts = line.split('\t')
-            if len(parts) < 5:
-                continue
 
-            metadata.append({
-                'region_idx': int(parts[0]),
-                'genomic_start': int(parts[1]),
-                'genomic_end': int(parts[2]),
-                'method': parts[3],
-                'confidence': float(parts[4]),
-                'region_length': int(parts[2]) - int(parts[1]),
-            })
+            if len(parts) >= 5:
+                # 5-column format: region_idx, genomic_start, genomic_end, method, confidence
+                metadata.append({
+                    'region_idx': int(parts[0]),
+                    'genomic_start': int(parts[1]),
+                    'genomic_end': int(parts[2]),
+                    'method': parts[3],
+                    'confidence': float(parts[4]),
+                    'region_length': int(parts[2]) - int(parts[1]),
+                })
+            elif len(parts) >= 2:
+                # 4-column merged format: region_id, seq_len, top_feature_indices, top_feature_values
+                # Extract region index from region_id (e.g. "region_42" -> 42)
+                region_id = parts[0]
+                seq_len = int(parts[1])
+                idx = int(region_id.split('_')[1]) if '_' in region_id else len(metadata)
+                metadata.append({
+                    'region_idx': idx,
+                    'genomic_start': 0,
+                    'genomic_end': seq_len,
+                    'method': 'unknown',
+                    'confidence': 0.0,
+                    'region_length': seq_len,
+                })
 
     if logger:
         logger.info(f"Loaded metadata for {len(metadata)} regions from {results_tsv}")
@@ -425,6 +609,8 @@ def compute_embedding_and_clusters(
     n_neighbors: int = 15,
     random_state: int = 42,
     logger: logging.Logger = None,
+    checkpoint_dir: str = None,
+    n_pca_components: int = 0,
 ) -> Dict[str, Any]:
     """
     Compute 2D embedding and Leiden clusters from max-pooled SAE vectors.
@@ -440,6 +626,7 @@ def compute_embedding_and_clusters(
         n_neighbors: Number of neighbors for kNN graph
         random_state: Random seed
         logger: Optional logger
+        checkpoint_dir: If set, saves Leiden/UMAP/t-SNE immediately after each step
 
     Returns:
         Dict with keys:
@@ -469,7 +656,9 @@ def compute_embedding_and_clusters(
     if _check_scanpy():
         return _compute_embedding_scanpy(
             pooled_vectors, region_metadata, method,
-            leiden_resolution, n_neighbors, random_state, logger
+            leiden_resolution, n_neighbors, random_state, logger,
+            checkpoint_dir=checkpoint_dir,
+            n_pca_components=n_pca_components,
         )
     elif _check_sklearn():
         if logger:
@@ -495,10 +684,19 @@ def _compute_embedding_scanpy(
     n_neighbors: int,
     random_state: int,
     logger: logging.Logger = None,
+    checkpoint_dir: str = None,
+    n_pca_components: int = 0,
 ) -> Dict[str, Any]:
-    """Compute embedding + clustering via scanpy."""
+    """Compute embedding + clustering via scanpy.
+
+    If checkpoint_dir is set, saves Leiden clusters and UMAP embedding
+    immediately after computing each, before t-SNE starts. This prevents
+    losing hours of computation if t-SNE times out.
+    """
     import scanpy as sc
     import anndata
+
+    sc.settings.verbosity = 2  # log hints and progress
 
     if logger:
         logger.info(
@@ -506,17 +704,56 @@ def _compute_embedding_scanpy(
             f"leiden_resolution={leiden_resolution}, embedding={method}"
         )
 
-    # Build AnnData object
-    adata = anndata.AnnData(X=pooled_vectors.copy())
+    # Optional PCA dimensionality reduction BEFORE building AnnData
+    # (avoids copying the full matrix into AnnData, saving ~91GB of RAM)
+    use_rep = 'X'
+    pca_result = None
+    if n_pca_components > 0:
+        if logger:
+            logger.info(f"Running IncrementalPCA: {pooled_vectors.shape[1]} → {n_pca_components} dimensions "
+                        f"(batch mode to avoid OOM on large datasets)")
+        from sklearn.decomposition import IncrementalPCA
+        batch_size = max(1000, n_pca_components * 3)
+        ipca = IncrementalPCA(n_components=n_pca_components, batch_size=batch_size)
+        pca_result = ipca.fit_transform(pooled_vectors)
+        variance_ratio = ipca.explained_variance_ratio_.sum()
+        if logger:
+            logger.info(f"PCA done: {variance_ratio:.1%} variance explained by {n_pca_components} components")
+        # Build AnnData from PCA-reduced vectors (small, ~113MB for 740K x 50)
+        adata = anndata.AnnData(X=pca_result)
+        adata.obsm['X_pca'] = pca_result
+        use_rep = 'X_pca'
+        # Free the large original vectors
+        del pooled_vectors
+    else:
+        # No PCA — build AnnData from full vectors (avoid .copy() to save memory)
+        adata = anndata.AnnData(X=pooled_vectors)
+
     adata.obs['method'] = [m.get('method', 'unknown') for m in region_metadata]
     adata.obs['confidence'] = [m.get('confidence', 0.0) for m in region_metadata]
     adata.obs['genomic_start'] = [m.get('genomic_start', 0) for m in region_metadata]
     adata.obs['genomic_end'] = [m.get('genomic_end', 0) for m in region_metadata]
     adata.obs['region_length'] = [m.get('region_length', 0) for m in region_metadata]
 
-    # Neighbor graph with cosine metric on raw features (no PCA needed)
+    # Neighbor graph
     sc.pp.neighbors(adata, n_neighbors=n_neighbors, metric='cosine',
-                    use_rep='X', random_state=random_state)
+                    use_rep=use_rep, random_state=random_state)
+
+    # Save PCA vectors + neighbor graph checkpoint
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        if 'X_pca' in adata.obsm:
+            pca_path = os.path.join(checkpoint_dir, "pca_vectors.npy")
+            np.save(pca_path, adata.obsm['X_pca'])
+            if logger:
+                logger.info(f"Checkpoint: saved PCA vectors {adata.obsm['X_pca'].shape} to {checkpoint_dir}/")
+        # Save full AnnData with neighbor graph (without the large X matrix to save space)
+        neighbors_path = os.path.join(checkpoint_dir, "neighbors.h5ad")
+        adata_light = adata.copy()
+        adata_light.X = None  # don't save the 91G matrix
+        adata_light.write_h5ad(neighbors_path)
+        if logger:
+            logger.info(f"Checkpoint: saved neighbor graph to {neighbors_path}")
 
     # Leiden clustering
     sc.tl.leiden(adata, resolution=leiden_resolution, random_state=random_state)
@@ -525,6 +762,12 @@ def _compute_embedding_scanpy(
     if logger:
         n_clusters = len(np.unique(cluster_assignments))
         logger.info(f"Leiden clustering: {n_clusters} clusters found")
+
+    # Save Leiden checkpoint immediately
+    if checkpoint_dir:
+        np.save(os.path.join(checkpoint_dir, "cluster_assignments.npy"), cluster_assignments)
+        if logger:
+            logger.info(f"Checkpoint: saved Leiden clusters to {checkpoint_dir}/")
 
     # Embeddings
     embedding_umap = None
@@ -535,12 +778,21 @@ def _compute_embedding_scanpy(
         embedding_umap = adata.obsm['X_umap'].copy()
         if logger:
             logger.info("UMAP embedding computed")
+        # Save UMAP checkpoint immediately
+        if checkpoint_dir:
+            np.save(os.path.join(checkpoint_dir, "embedding_umap.npy"), embedding_umap)
+            if logger:
+                logger.info(f"Checkpoint: saved UMAP to {checkpoint_dir}/")
 
     if method in ("tsne", "both"):
-        sc.tl.tsne(adata, random_state=random_state, use_rep='X')
+        sc.tl.tsne(adata, random_state=random_state, use_rep=use_rep, n_jobs=-1)
         embedding_tsne = adata.obsm['X_tsne'].copy()
         if logger:
             logger.info("t-SNE embedding computed")
+        if checkpoint_dir:
+            np.save(os.path.join(checkpoint_dir, "embedding_tsne.npy"), embedding_tsne)
+            if logger:
+                logger.info(f"Checkpoint: saved t-SNE to {checkpoint_dir}/")
 
     return {
         'embedding_umap': embedding_umap,
@@ -567,6 +819,7 @@ def _compute_embedding_sklearn(
         metric='cosine',
         random_state=random_state,
         perplexity=min(30, pooled_vectors.shape[0] - 1),
+        verbose=2,
     )
     embedding_tsne = tsne.fit_transform(pooled_vectors)
 
@@ -594,12 +847,11 @@ def plot_embedding(
     logger: logging.Logger = None,
 ):
     """
-    4-panel scatter plot of 2D embedding colored by various metadata.
+    3-panel scatter plot of 2D embedding colored by various metadata.
 
-    Panel 1: Leiden cluster (discrete colors)
-    Panel 2: Detection method (zscore=red, MAD=blue)
-    Panel 3: start_confidence (viridis)
-    Panel 4: region_length (plasma)
+    Panel 1: Cluster & detection method summary
+    Panel 2: Start confidence (blue-to-red gradient)
+    Panel 3: Genomic position (blue-to-red gradient)
 
     Args:
         coordinates: (N, 2) embedding coordinates
@@ -617,64 +869,92 @@ def plot_embedding(
     n = len(coordinates)
     x, y = coordinates[:, 0], coordinates[:, 1]
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+    # Publication-ready settings
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
+        'font.size': 14,
+        'axes.linewidth': 1.5,
+        'xtick.major.width': 1.2,
+        'ytick.major.width': 1.2,
+        'xtick.major.size': 6,
+        'ytick.major.size': 6,
+    })
+
+    DOT_SIZE = 5
+    DOT_ALPHA = 0.8
+
+    # Blue-to-red gradient for continuous colormaps (high contrast)
+    from matplotlib.colors import LinearSegmentedColormap
+    blue_red_cmap = LinearSegmentedColormap.from_list('blue_red',
+        ['#08306b', '#2166ac', '#4393c3', '#f4a582', '#d6604d', '#b2182b', '#67001f'])
+
+    fig, axes = plt.subplots(1, 3, figsize=(27, 8))
     fig.suptitle(
-        f'{embedding_name} Embedding of Max-Pooled SAE Region Fingerprints (N={n})',
-        fontsize=14, fontweight='bold', y=0.98
+        f'{embedding_name} Embedding of Max-Pooled SAE Region Fingerprints (N={n:,})',
+        fontsize=20, fontweight='bold', y=0.98
     )
 
-    # --- Panel 1: Leiden cluster ---
-    ax = axes[0, 0]
+    # --- Panel 1: Cluster & Method summary (combined) ---
+    ax = axes[0]
     unique_clusters = sorted(np.unique(cluster_assignments))
-    cmap_discrete = plt.cm.tab10 if len(unique_clusters) <= 10 else plt.cm.tab20
-    cluster_colors = {c: cmap_discrete(i % 20) for i, c in enumerate(unique_clusters)}
-
-    for c in unique_clusters:
-        mask = cluster_assignments == c
-        ax.scatter(x[mask], y[mask], c=[cluster_colors[c]], label=f'Cluster {c}',
-                   s=50, alpha=0.8, edgecolors='white', linewidth=0.5)
-    ax.legend(fontsize=8, loc='best', framealpha=0.9)
-    ax.set_title('Leiden Cluster', fontsize=11, fontweight='bold')
-    ax.set_xlabel(f'{embedding_name} 1', fontsize=9)
-    ax.set_ylabel(f'{embedding_name} 2', fontsize=9)
-
-    # --- Panel 2: Detection method ---
-    ax = axes[0, 1]
+    n_clusters = len(unique_clusters)
     methods = [m.get('method', 'unknown') for m in region_metadata]
     unique_methods = sorted(set(methods))
+    from collections import Counter
+    method_counts = Counter(methods)
 
+    cluster_cmap = plt.colormaps.get_cmap('tab20')
+    cluster_colors = [cluster_cmap(c % 20) for c in cluster_assignments]
+    ax.scatter(x, y, c=cluster_colors, s=DOT_SIZE, alpha=DOT_ALPHA,
+               edgecolors='none', rasterized=True)
+
+    # Build summary text
+    cluster_str = f"Leiden clusters: {n_clusters}"
+    for c in unique_clusters:
+        cnt = int(np.sum(cluster_assignments == c))
+        cluster_str += f"\n  Cluster {c}: {cnt:,} regions"
+    method_str = "Detection method:"
     for meth in unique_methods:
-        mask = np.array([m == meth for m in methods])
-        color = METHOD_COLORS.get(meth, '#999999')
-        ax.scatter(x[mask], y[mask], c=color, label=meth,
-                   s=50, alpha=0.8, edgecolors='white', linewidth=0.5)
-    ax.legend(fontsize=8, loc='best', framealpha=0.9)
-    ax.set_title('Detection Method', fontsize=11, fontweight='bold')
-    ax.set_xlabel(f'{embedding_name} 1', fontsize=9)
-    ax.set_ylabel(f'{embedding_name} 2', fontsize=9)
+        method_str += f"\n  {meth}: {method_counts[meth]:,} regions"
 
-    # --- Panel 3: Confidence (continuous) ---
-    ax = axes[1, 0]
+    ax.text(0.03, 0.97, f"{cluster_str}\n\n{method_str}",
+            transform=ax.transAxes, fontsize=12, verticalalignment='top',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9))
+    ax.set_title(f'Cluster & Detection Method (N={n:,})', fontsize=16, fontweight='bold')
+    ax.set_xlabel(f'{embedding_name} 1', fontsize=14)
+    ax.set_ylabel(f'{embedding_name} 2', fontsize=14)
+    ax.tick_params(axis='both', labelsize=12)
+
+    # --- Panel 2: Start Confidence (blue-to-red) ---
+    ax = axes[1]
     confidences = np.array([m.get('confidence', 0.0) for m in region_metadata])
-    sc3 = ax.scatter(x, y, c=confidences, cmap='viridis',
-                     s=50, alpha=0.8, edgecolors='white', linewidth=0.5)
-    plt.colorbar(sc3, ax=ax, shrink=0.8, pad=0.02, label='Confidence')
-    ax.set_title('Start Confidence', fontsize=11, fontweight='bold')
-    ax.set_xlabel(f'{embedding_name} 1', fontsize=9)
-    ax.set_ylabel(f'{embedding_name} 2', fontsize=9)
+    sc2 = ax.scatter(x, y, c=confidences, cmap=blue_red_cmap,
+                     s=DOT_SIZE, alpha=DOT_ALPHA, edgecolors='none', rasterized=True)
+    cbar2 = plt.colorbar(sc2, ax=ax, shrink=0.8, pad=0.02)
+    cbar2.set_label('Confidence', fontsize=13)
+    cbar2.ax.tick_params(labelsize=11)
+    ax.set_title(f'Start Confidence (N={n:,})', fontsize=16, fontweight='bold')
+    ax.set_xlabel(f'{embedding_name} 1', fontsize=14)
+    ax.set_ylabel(f'{embedding_name} 2', fontsize=14)
+    ax.tick_params(axis='both', labelsize=12)
 
-    # --- Panel 4: Region length (continuous) ---
-    ax = axes[1, 1]
-    lengths = np.array([m.get('region_length', 0) for m in region_metadata])
-    sc4 = ax.scatter(x, y, c=lengths, cmap='plasma',
-                     s=50, alpha=0.8, edgecolors='white', linewidth=0.5)
-    plt.colorbar(sc4, ax=ax, shrink=0.8, pad=0.02, label='Region Length (bp)')
-    ax.set_title('Region Length', fontsize=11, fontweight='bold')
-    ax.set_xlabel(f'{embedding_name} 1', fontsize=9)
-    ax.set_ylabel(f'{embedding_name} 2', fontsize=9)
+    # --- Panel 3: Genomic Position (blue-to-red) ---
+    ax = axes[2]
+    genomic_starts = np.array([m.get('genomic_start', 0) for m in region_metadata], dtype=float)
+    genomic_mbp = genomic_starts / 1e6
+    sc4 = ax.scatter(x, y, c=genomic_mbp, cmap=blue_red_cmap,
+                     s=DOT_SIZE, alpha=DOT_ALPHA, edgecolors='none', rasterized=True)
+    cbar4 = plt.colorbar(sc4, ax=ax, shrink=0.8, pad=0.02)
+    cbar4.set_label('Genomic Position (Mbp)', fontsize=13)
+    cbar4.ax.tick_params(labelsize=11)
+    ax.set_title(f'Genomic Position (N={n:,})', fontsize=16, fontweight='bold')
+    ax.set_xlabel(f'{embedding_name} 1', fontsize=14)
+    ax.set_ylabel(f'{embedding_name} 2', fontsize=14)
+    ax.tick_params(axis='both', labelsize=12)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
 
     if logger:
@@ -695,22 +975,22 @@ def _plot_annotation_embedding(
     import matplotlib.pyplot as plt
 
     annotation_colors = {
-        "CDS": "#e41a1c",
-        "UTR/exon": "#ff7f00",
-        "Intron": "#377eb8",
-        "Intergenic": "#999999",
+        "CDS": "#E74C3C",
+        "UTR/exon": "#F39C12",
+        "Intron": "#5DADE2",
+        "Intergenic": "#BDC3C7",
     }
     annotation_order = ["CDS", "UTR/exon", "Intron", "Intergenic"]
 
     x, y = coordinates[:, 0], coordinates[:, 1]
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(14, 12))
     for label in annotation_order:
         mask = np.array([a == label for a in annotations])
         if mask.any():
-            ax.scatter(x[mask], y[mask], c=annotation_colors.get(label, '#999999'),
+            ax.scatter(x[mask], y[mask], c=annotation_colors.get(label, '#BDC3C7'),
                        label=f"{label} ({mask.sum()})",
-                       s=30, alpha=0.7, edgecolors='none')
-    ax.legend(fontsize=11, markerscale=2)
+                       s=3, alpha=0.5, edgecolors='none', rasterized=True)
+    ax.legend(fontsize=11, markerscale=4)
     ax.set_title(f"{embedding_name} of SAE Region Fingerprints (N={n_regions})\n"
                  f"Colored by Genomic Annotation", fontsize=13)
     ax.set_xlabel(f"{embedding_name} 1")
@@ -1267,8 +1547,18 @@ Examples:
         """
     )
 
-    parser.add_argument("--input_dir", required=True,
-                        help="Path to output dir from run_sae_on_chromosome_drops.py")
+    parser.add_argument("--input_dir", default=None,
+                        help="Path to output dir from run_sae_on_chromosome_drops.py "
+                             "(merged NPZ mode). Required unless --from_shards is used.")
+    parser.add_argument("--from_shards", action="store_true",
+                        help="Read directly from shard directories instead of merged NPZ. "
+                             "Requires --chrom and --results_dir.")
+    parser.add_argument("--chrom", type=str, default=None,
+                        help="Chromosome name (e.g. chr22). Required with --from_shards.")
+    parser.add_argument("--results_dir", type=str, default="results/",
+                        help="Root results directory (default: results/). Used with --from_shards.")
+    parser.add_argument("--n_shards", type=int, default=36,
+                        help="Number of shards (default: 36). Used with --from_shards.")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Output dir (default: <input_dir>/latent_analysis/)")
     parser.add_argument("--embedding", type=str, default="both",
@@ -1297,25 +1587,34 @@ Examples:
     args = parser.parse_args()
     logger = setup_logging(args.log_level)
 
-    input_dir = os.path.abspath(args.input_dir)
-    output_dir = args.output_dir or os.path.join(input_dir, 'latent_analysis')
+    # Validate args
+    # Determine output suffix based on normalization
+    _latent_suffix = "latent_analysis_normalized" if args.global_stats else "latent_analysis"
+
+    if args.from_shards:
+        if not args.chrom:
+            parser.error("--from_shards requires --chrom")
+        results_dir = os.path.abspath(args.results_dir)
+        if args.output_dir:
+            output_dir = os.path.abspath(args.output_dir)
+        else:
+            output_dir = os.path.join(results_dir, args.chrom, "sae", _latent_suffix)
+        input_dir = None
+    else:
+        if not args.input_dir:
+            parser.error("--input_dir is required (or use --from_shards)")
+        input_dir = os.path.abspath(args.input_dir)
+        output_dir = args.output_dir or os.path.join(input_dir, _latent_suffix)
 
     logger.info("=" * 70)
     logger.info("SAE Region Latent Analysis")
     logger.info("=" * 70)
-    logger.info(f"Input dir:  {input_dir}")
+    if args.from_shards:
+        logger.info(f"Mode:       from_shards ({args.chrom}, {args.n_shards} shards)")
+        logger.info(f"Results:    {results_dir}")
+    else:
+        logger.info(f"Input dir:  {input_dir}")
     logger.info(f"Output dir: {output_dir}")
-
-    # Validate input files exist
-    npz_path = os.path.join(input_dir, 'data', 'feature_matrices.npz')
-    tsv_path = os.path.join(input_dir, 'data', 'sae_results.tsv')
-
-    if not os.path.exists(npz_path):
-        logger.error(f"Feature matrices not found: {npz_path}")
-        sys.exit(1)
-    if not os.path.exists(tsv_path):
-        logger.error(f"SAE results not found: {tsv_path}")
-        sys.exit(1)
 
     # Create output dirs
     data_dir = os.path.join(output_dir, 'data')
@@ -1330,16 +1629,68 @@ Examples:
     logger.info("STEP 1: Loading and pooling feature matrices")
     logger.info("-" * 50)
 
-    pooled_vectors, n_regions = load_and_pool_feature_matrices(
-        npz_path, pool_method=args.pool_method, logger=logger
-    )
+    tsv_paths_from_shards = None
+
+    # Check for cached pooled vectors from a previous run
+    # Also check raw run's cache for normalized runs (pooling is identical, normalization applied after)
+    cached_pooled = os.path.join(data_dir, 'maxpooled_vectors.npy')
+    if not os.path.exists(cached_pooled) and args.global_stats and args.from_shards:
+        raw_cached = os.path.join(results_dir, args.chrom, "sae", "latent_analysis", "data", "maxpooled_vectors.npy")
+        if os.path.exists(raw_cached):
+            cached_pooled = raw_cached
+            logger.info(f"RESUME: Will load raw pooled vectors from {raw_cached} (normalization applied after)")
+    if os.path.exists(cached_pooled):
+        logger.info(f"RESUME: Loading cached pooled vectors from {cached_pooled}")
+        pooled_vectors = np.load(cached_pooled)
+        n_regions = pooled_vectors.shape[0]
+        logger.info(f"  Loaded {n_regions} pooled vectors ({pooled_vectors.shape})")
+        # Still need tsv_paths for metadata loading
+        if args.from_shards:
+            import re, glob as _glob
+            sae_root = os.path.join(results_dir, args.chrom, "sae")
+            shard_pattern = re.compile(r"shard(\d+)of(\d+)")
+            seen = {}
+            for entry in sorted(os.listdir(sae_root)):
+                if "merged" in entry:
+                    continue
+                m = shard_pattern.search(entry)
+                if not m or int(m.group(2)) != args.n_shards:
+                    continue
+                full = os.path.join(sae_root, entry)
+                if os.path.isfile(os.path.join(full, "COMPLETED")):
+                    tsv = os.path.join(full, "data", "sae_results.tsv")
+                    if os.path.isfile(tsv):
+                        seen[int(m.group(1))] = tsv
+            tsv_paths_from_shards = [seen[k] for k in sorted(seen.keys())]
+    elif args.from_shards:
+        pooled_vectors, n_regions, tsv_paths_from_shards = load_and_pool_from_shards(
+            results_dir, args.chrom,
+            pool_method=args.pool_method,
+            n_shards=args.n_shards,
+            logger=logger,
+        )
+    else:
+        # Validate input files exist
+        npz_path = os.path.join(input_dir, 'data', 'feature_matrices.npz')
+        tsv_path = os.path.join(input_dir, 'data', 'sae_results.tsv')
+
+        if not os.path.exists(npz_path):
+            logger.error(f"Feature matrices not found: {npz_path}")
+            sys.exit(1)
+        if not os.path.exists(tsv_path):
+            logger.error(f"SAE results not found: {tsv_path}")
+            sys.exit(1)
+
+        pooled_vectors, n_regions = load_and_pool_feature_matrices(
+            npz_path, pool_method=args.pool_method, logger=logger
+        )
 
     # Optional: apply genome-wide normalization
     if args.global_stats:
         logger.info(f"Applying genome-wide z-score normalization from {args.global_stats}")
         gstats = dict(np.load(args.global_stats))
-        mean = gstats["mean"]
-        std = gstats["std"]
+        mean = gstats.get("mean", gstats.get("cross_chrom_mean"))
+        std = gstats.get("std", gstats.get("cross_chrom_std"))
         valid = gstats.get("valid_mask", std > 0)
         normalized = np.zeros_like(pooled_vectors)
         normalized[:, valid] = (pooled_vectors[:, valid] - mean[valid]) / std[valid]
@@ -1353,7 +1704,19 @@ Examples:
     logger.info("STEP 2: Loading region metadata")
     logger.info("-" * 50)
 
-    region_metadata = load_region_metadata(tsv_path, logger=logger)
+    if tsv_paths_from_shards:
+        # Merge metadata from all shard TSVs
+        region_metadata = []
+        for tsv in tsv_paths_from_shards:
+            region_metadata.extend(load_region_metadata(tsv))
+        if logger:
+            logger.info(f"Loaded metadata for {len(region_metadata)} regions from {len(tsv_paths_from_shards)} shard TSVs")
+    else:
+        tsv_path = os.path.join(input_dir, 'data', 'sae_results.tsv')
+        if not os.path.exists(tsv_path):
+            logger.error(f"SAE results not found: {tsv_path}")
+            sys.exit(1)
+        region_metadata = load_region_metadata(tsv_path, logger=logger)
 
     # Validate alignment
     if len(region_metadata) != n_regions:
@@ -1382,27 +1745,42 @@ Examples:
     # STEP 3: Compute cosine similarity
     # =========================================================================
     logger.info("")
-    logger.info("STEP 3: Computing pairwise cosine similarity")
-    logger.info("-" * 50)
+    cached_sim = os.path.join(data_dir, 'cosine_similarity.npy')
+    if os.path.exists(cached_sim):
+        logger.info(f"RESUME: Loading cached similarity matrix from {cached_sim}")
+        similarity_matrix = np.load(cached_sim)
+        logger.info(f"  Loaded {similarity_matrix.shape}")
+    else:
+        logger.info("STEP 3: Computing pairwise cosine similarity")
+        logger.info("-" * 50)
+        similarity_matrix = compute_cosine_similarity(pooled_vectors, logger=logger)
 
-    similarity_matrix = compute_cosine_similarity(pooled_vectors, logger=logger)
+    # Save intermediate results immediately (in case plotting OOMs later)
+    if not os.path.exists(cached_sim):
+        logger.info("Saving intermediate data (pooled vectors, similarity matrix)...")
+        np.save(os.path.join(data_dir, 'maxpooled_vectors.npy'), pooled_vectors)
+        np.save(os.path.join(data_dir, 'cosine_similarity.npy'), similarity_matrix)
+        logger.info(f"  Saved to {data_dir}/")
 
     # =========================================================================
     # STEP 4: Plot cosine similarity heatmap (genomic order)
     # =========================================================================
     logger.info("")
-    logger.info("STEP 4: Plotting cosine similarity heatmap")
-    logger.info("-" * 50)
+    if n_regions > 10000:
+        logger.info("STEP 4: Skipping cosine similarity heatmap (N=%d too large for matplotlib)", n_regions)
+    else:
+        logger.info("STEP 4: Plotting cosine similarity heatmap")
+        logger.info("-" * 50)
 
-    # Sort by genomic position for the default heatmap
-    genomic_order = np.argsort([m.get('genomic_start', 0) for m in region_metadata])
-    plot_cosine_similarity_heatmap(
-        similarity_matrix, region_metadata,
-        os.path.join(plots_dir, 'cosine_similarity_heatmap.png'),
-        order=genomic_order,
-        title_suffix=" (genomic order)",
-        logger=logger,
-    )
+        # Sort by genomic position for the default heatmap
+        genomic_order = np.argsort([m.get('genomic_start', 0) for m in region_metadata])
+        plot_cosine_similarity_heatmap(
+            similarity_matrix, region_metadata,
+            os.path.join(plots_dir, 'cosine_similarity_heatmap.png'),
+            order=genomic_order,
+            title_suffix=" (genomic order)",
+            logger=logger,
+        )
 
     # =========================================================================
     # STEP 5: Embedding and clustering
@@ -1424,7 +1802,7 @@ Examples:
         clusters = embedding_results['cluster_assignments']
 
         # --- Clustered cosine similarity heatmap ---
-        if embedding_results['n_clusters'] > 1:
+        if embedding_results['n_clusters'] > 1 and n_regions <= 10000:
             cluster_order = np.argsort(clusters)
             plot_cosine_similarity_heatmap(
                 similarity_matrix, region_metadata,
@@ -1433,17 +1811,10 @@ Examples:
                 title_suffix=" (clustered)",
                 logger=logger,
             )
+        elif n_regions > 10000:
+            logger.info("Skipping clustered heatmap (N=%d too large)", n_regions)
 
         # --- Embedding scatter plots ---
-        if embedding_results['embedding_umap'] is not None:
-            plot_embedding(
-                embedding_results['embedding_umap'],
-                region_metadata, clusters,
-                os.path.join(plots_dir, 'umap_4panel.png'),
-                embedding_name="UMAP",
-                logger=logger,
-            )
-
         if embedding_results['embedding_tsne'] is not None:
             plot_embedding(
                 embedding_results['embedding_tsne'],
@@ -1453,63 +1824,76 @@ Examples:
                 logger=logger,
             )
 
-        # --- Annotation-colored embedding (if --annotation_tsv provided) ---
-        if args.annotation_tsv:
-            import pandas as pd
-            ann_df = pd.read_csv(args.annotation_tsv, sep='\t', comment='#')
-            if 'annotation' in ann_df.columns and len(ann_df) == n_regions:
-                annotations = ann_df['annotation'].tolist()
-                for emb_key, emb_name in [('embedding_tsne', 't-SNE'),
-                                           ('embedding_umap', 'UMAP')]:
-                    coords = embedding_results.get(emb_key)
-                    if coords is None:
-                        continue
-                    _plot_annotation_embedding(
-                        coords, annotations,
-                        os.path.join(plots_dir, f'{emb_name.lower().replace("-", "")}_by_annotation.png'),
-                        embedding_name=emb_name, n_regions=n_regions, logger=logger,
-                    )
-            else:
-                logger.warning(f"--annotation_tsv: expected {n_regions} rows with 'annotation' column, "
-                               f"got {len(ann_df)} rows, columns={list(ann_df.columns)}")
-
-        # --- Cluster composition ---
-        if embedding_results['n_clusters'] > 1:
-            plot_cluster_composition(
-                clusters, region_metadata,
-                os.path.join(plots_dir, 'cluster_composition.png'),
+        if embedding_results['embedding_umap'] is not None:
+            plot_embedding(
+                embedding_results['embedding_umap'],
+                region_metadata, clusters,
+                os.path.join(plots_dir, 'umap_4panel.png'),
+                embedding_name="UMAP",
                 logger=logger,
             )
 
-        # --- Additional latent analysis plots ---
-        if embedding_results['n_clusters'] > 1:
-            logger.info("")
-            logger.info("Generating additional latent analysis plots")
-            logger.info("-" * 50)
+        # --- Skip heavy plots for large region counts ---
+        if n_regions <= 10000:
+            # --- Annotation-colored embedding (if --annotation_tsv provided) ---
+            if args.annotation_tsv:
+                import pandas as pd
+                ann_df = pd.read_csv(args.annotation_tsv, sep='\t', comment='#')
+                if 'annotation' in ann_df.columns and len(ann_df) == n_regions:
+                    annotations = ann_df['annotation'].tolist()
+                    for emb_key, emb_name in [('embedding_tsne', 't-SNE'),
+                                               ('embedding_umap', 'UMAP')]:
+                        coords = embedding_results.get(emb_key)
+                        if coords is None:
+                            continue
+                        _plot_annotation_embedding(
+                            coords, annotations,
+                            os.path.join(plots_dir, f'{emb_name.lower().replace("-", "")}_by_annotation.png'),
+                            embedding_name=emb_name, n_regions=n_regions, logger=logger,
+                        )
+                else:
+                    logger.warning(f"--annotation_tsv: expected {n_regions} rows with 'annotation' column, "
+                                   f"got {len(ann_df)} rows, columns={list(ann_df.columns)}")
 
-            plot_cluster_feature_profiles(
-                clusters, pooled_vectors,
-                os.path.join(plots_dir, 'cluster_feature_profiles.png'),
-                logger=logger,
-            )
+            # --- Cluster composition ---
+            if embedding_results['n_clusters'] > 1:
+                plot_cluster_composition(
+                    clusters, region_metadata,
+                    os.path.join(plots_dir, 'cluster_composition.png'),
+                    logger=logger,
+                )
 
-            plot_genomic_position_by_cluster(
-                clusters, region_metadata,
-                os.path.join(plots_dir, 'genomic_position_by_cluster.png'),
-                logger=logger,
-            )
+            # --- Additional latent analysis plots ---
+            if embedding_results['n_clusters'] > 1:
+                logger.info("")
+                logger.info("Generating additional latent analysis plots")
+                logger.info("-" * 50)
 
-            plot_cluster_feature_heatmap(
-                clusters, pooled_vectors,
-                os.path.join(plots_dir, 'cluster_feature_heatmap.png'),
-                logger=logger,
-            )
+                plot_cluster_feature_profiles(
+                    clusters, pooled_vectors,
+                    os.path.join(plots_dir, 'cluster_feature_profiles.png'),
+                    logger=logger,
+                )
 
-            plot_region_size_distribution(
-                clusters, region_metadata,
-                os.path.join(plots_dir, 'region_size_distribution.png'),
-                logger=logger,
-            )
+                plot_genomic_position_by_cluster(
+                    clusters, region_metadata,
+                    os.path.join(plots_dir, 'genomic_position_by_cluster.png'),
+                    logger=logger,
+                )
+
+                plot_cluster_feature_heatmap(
+                    clusters, pooled_vectors,
+                    os.path.join(plots_dir, 'cluster_feature_heatmap.png'),
+                    logger=logger,
+                )
+
+                plot_region_size_distribution(
+                    clusters, region_metadata,
+                    os.path.join(plots_dir, 'region_size_distribution.png'),
+                    logger=logger,
+                )
+        else:
+            logger.info("Skipping heavy plots (N=%d > 10000) — t-SNE/UMAP saved", n_regions)
 
         # =====================================================================
         # STEP 6: Cluster summary statistics
@@ -1522,6 +1906,20 @@ Examples:
             clusters, region_metadata, pooled_vectors, similarity_matrix,
             logger=logger,
         )
+
+        # Save clustering results immediately (in case plotting OOMs later)
+        logger.info("Saving intermediate clustering results...")
+        import pandas as pd
+        cluster_df = pd.DataFrame([
+            {**m, 'cluster': int(clusters[i])} for i, m in enumerate(region_metadata)
+        ])
+        cluster_df.to_csv(os.path.join(data_dir, 'cluster_assignments.tsv'), sep='\t', index=False)
+        if embedding_results.get('embedding_tsne') is not None:
+            np.save(os.path.join(data_dir, 'embedding_tsne.npy'), embedding_results['embedding_tsne'])
+        if embedding_results.get('embedding_umap') is not None:
+            np.save(os.path.join(data_dir, 'embedding_umap.npy'), embedding_results['embedding_umap'])
+        logger.info(f"  Saved cluster assignments and embeddings to {data_dir}/")
+
     else:
         logger.info("")
         logger.info("STEP 5: Skipping clustering (--skip_clustering)")

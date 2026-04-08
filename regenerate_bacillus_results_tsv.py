@@ -34,6 +34,22 @@ def find_merged_dir():
         sys.exit(1)
     return dirs[-1]
 
+def load_feature_matrices(merged_dir):
+    """Load feature_matrices.npz from merged directory."""
+    path = os.path.join(merged_dir, "data", "feature_matrices.npz")
+    if not os.path.exists(path):
+        print(f"ERROR: feature_matrices.npz not found at {path}")
+        sys.exit(1)
+
+    data = np.load(path, allow_pickle=False)
+    matrices = {}
+    for key in sorted(data.files, key=lambda x: int(x.split('_')[1])):
+        idx = int(key.split('_')[1])
+        matrices[idx] = data[key]  # shape: (seq_len, n_features)
+
+    print(f"Loaded {len(matrices)} region feature matrices")
+    return matrices
+
 def extract_top_features(feature_matrix, n_top=10):
     """Extract top N features by max activation across the sequence."""
     max_activations = feature_matrix.max(axis=0)  # max over sequence positions
@@ -41,27 +57,17 @@ def extract_top_features(feature_matrix, n_top=10):
     top_values = max_activations[top_indices]
     return list(zip(top_indices, top_values))
 
-def generate_sae_results_tsv(merged_dir, output_path):
-    """Generate sae_results.tsv from feature matrices, streaming to avoid OOM."""
-
-    path = os.path.join(merged_dir, "data", "feature_matrices.npz")
-    if not os.path.exists(path):
-        print(f"ERROR: feature_matrices.npz not found at {path}")
-        sys.exit(1)
+def generate_sae_results_tsv(matrices, output_path):
+    """Generate sae_results.tsv from feature matrices."""
 
     with open(output_path, 'w') as f:
-        # Write header
+        # Write header (mimics run_sae_fast.py output)
         f.write("# SAE Feature Analysis Results\n")
         f.write("# Region\tSequence_Length\tTop_Features\tMax_Activations\n")
         f.write("region_id\tseq_len\ttop_feature_indices\ttop_feature_values\n")
 
-        # Stream load from NPZ (only one region at a time)
-        data = np.load(path, allow_pickle=False)
-        region_count = 0
-
-        for key in sorted(data.files, key=lambda x: int(x.split('_')[1])):
-            idx = int(key.split('_')[1])
-            mat = data[key]  # shape: (seq_len, n_features) - loaded into RAM
+        for idx in sorted(matrices.keys()):
+            mat = matrices[idx]
             seq_len = mat.shape[0]
 
             # Extract top 10 features
@@ -72,26 +78,21 @@ def generate_sae_results_tsv(merged_dir, output_path):
             feature_vals = ','.join(f'{val:.2f}' for _, val in top_features)
 
             f.write(f"region_{idx}\t{seq_len}\t{feature_ids}\t{feature_vals}\n")
-            region_count += 1
 
-            # Progress every 500 regions
-            if region_count % 500 == 0:
-                print(f"  Processed {region_count} regions...")
-
-        data.close()
-
-    print(f"Wrote sae_results.tsv: {output_path} ({region_count} regions)")
+    print(f"Wrote sae_results.tsv: {output_path}")
 
 def main():
     merged_dir = find_merged_dir()
     print(f"Using merged directory: {merged_dir}")
-    print(f"Streaming feature matrices (low-memory mode)...")
 
-    # Generate TSV by streaming NPZ file
+    # Load feature matrices
+    matrices = load_feature_matrices(merged_dir)
+
+    # Generate TSV
     output_tsv = os.path.join(merged_dir, "data", "sae_results.tsv")
-    generate_sae_results_tsv(merged_dir, output_tsv)
+    generate_sae_results_tsv(matrices, output_tsv)
 
-    print(f"✓ Bacillus sae_results.tsv regenerated")
+    print(f"✓ Bacillus sae_results.tsv regenerated ({len(matrices)} regions)")
     print(f"Ready for latent analysis!")
 
 if __name__ == '__main__':
