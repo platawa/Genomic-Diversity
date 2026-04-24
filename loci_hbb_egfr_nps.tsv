@@ -1,0 +1,4 @@
+organism	chrom	start	end	name	scoring_run
+human	chr11	5220466	5232072	HBB	auto
+human	chr7	55014032	55212339	EGFR	auto
+human	chr10	127544349	127557672	NPS	auto

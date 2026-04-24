@@ -90,6 +90,11 @@ def main():
     # Normalization
     parser.add_argument("--global_stats", type=str, default=None,
                         help="Path to genome-wide stats NPZ for z-score normalization.")
+    parser.add_argument("--norm_method", type=str, default=None,
+                        choices=["prenorm", "postnorm"],
+                        help="Normalization method: prenorm (z-score before max-pool using nuc_mean/nuc_std), "
+                             "postnorm (z-score after max-pool using chunk-max global_mean/global_std). "
+                             "Requires --global_stats.")
 
     parser.add_argument("--log_level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -98,7 +103,14 @@ def main():
     logger = setup_logging(args.log_level)
 
     # Determine output directory
-    _suffix = "latent_analysis_normalized" if args.global_stats else "latent_analysis"
+    if args.norm_method == "prenorm":
+        _suffix = "latent_analysis_prenorm"
+    elif args.norm_method == "postnorm":
+        _suffix = "latent_analysis_postnorm"
+    elif args.global_stats:
+        _suffix = "latent_analysis_normalized"
+    else:
+        _suffix = "latent_analysis"
 
     if args.from_shards:
         if not args.chrom:
@@ -137,41 +149,107 @@ def main():
     tsv_paths_from_shards = None
 
     if args.stage in ("pool", "both"):
-        # Check for cached raw vectors (for normalized runs)
-        if args.global_stats and os.path.isfile(os.path.join(raw_data_dir, "maxpooled_vectors.npy")):
-            logger.info("Loading raw pooled vectors (normalization will be applied)")
-            pooled_vectors = np.load(os.path.join(raw_data_dir, "maxpooled_vectors.npy"))
-            n_regions = pooled_vectors.shape[0]
-            logger.info(f"  Loaded {n_regions} vectors from {raw_data_dir}/")
-        elif os.path.isfile(pooled_path) and not args.global_stats:
-            logger.info(f"RESUME: Cached pooled vectors found at {pooled_path}")
-            pooled_vectors = np.load(pooled_path)
-            n_regions = pooled_vectors.shape[0]
-        elif args.from_shards:
-            logger.info("Pooling from shard directories...")
-            pooled_vectors, n_regions, tsv_paths_from_shards = load_and_pool_from_shards(
-                results_dir, args.chrom,
-                pool_method=args.pool_method,
-                n_shards=args.n_shards,
-                logger=logger,
-            )
-        else:
-            npz_path = os.path.join(args.input_dir, "data", "feature_matrices.npz")
-            pooled_vectors, n_regions = load_and_pool_feature_matrices(
-                npz_path, pool_method=args.pool_method, logger=logger
-            )
+        if args.norm_method == "prenorm":
+            # Option A: pre-normalize per nucleotide BEFORE max pooling
+            if not args.global_stats:
+                logger.error("--norm_method prenorm requires --global_stats")
+                sys.exit(1)
+            if os.path.isfile(pooled_path):
+                logger.info(f"RESUME: Pre-normalized pooled vectors already exist at {pooled_path}")
+                pooled_vectors = np.load(pooled_path)
+                n_regions = pooled_vectors.shape[0]
+            elif args.from_shards:
+                logger.info("Pre-normalizing + pooling from shard directories (Option A)...")
+                pooled_vectors, n_regions, tsv_paths_from_shards = load_and_pool_from_shards(
+                    results_dir, args.chrom,
+                    pool_method=args.pool_method,
+                    n_shards=args.n_shards,
+                    logger=logger,
+                    global_stats=args.global_stats,
+                )
+            else:
+                logger.error("--norm_method prenorm requires --from_shards (needs raw feature_ts)")
+                sys.exit(1)
 
-        # Apply normalization if requested
-        if args.global_stats:
-            logger.info(f"Applying genome-wide z-score normalization")
+        elif args.norm_method == "postnorm":
+            # Option B: max pool raw, then z-score with chunk-max stats
+            if not args.global_stats:
+                logger.error("--norm_method postnorm requires --global_stats")
+                sys.exit(1)
+            # Load raw pooled vectors
+            raw_pooled_path = os.path.join(raw_data_dir, "maxpooled_vectors.npy")
+            if os.path.isfile(raw_pooled_path):
+                logger.info(f"Loading raw pooled vectors from {raw_pooled_path}")
+                pooled_vectors = np.load(raw_pooled_path)
+            elif args.from_shards:
+                logger.info("Pooling from shard directories (raw)...")
+                pooled_vectors, _, tsv_paths_from_shards = load_and_pool_from_shards(
+                    results_dir, args.chrom,
+                    pool_method=args.pool_method,
+                    n_shards=args.n_shards,
+                    logger=logger,
+                )
+            else:
+                logger.error("No raw pooled vectors found and no --from_shards")
+                sys.exit(1)
+            n_regions = pooled_vectors.shape[0]
+            # Apply chunk-max-level z-score (global_mean/global_std are chunk-max Welford stats)
+            logger.info("Applying post-max-pool z-score with chunk-max stats (Option B)")
             gstats = dict(np.load(args.global_stats))
-            mean = gstats.get("mean", gstats.get("cross_chrom_mean"))
-            std = gstats.get("std", gstats.get("cross_chrom_std"))
+            # Postnorm priority: global_mean/std (human corrected) > chunk_max_mean/std
+            # (bacterial scan output) > mean/std (legacy). All three represent
+            # chunk-max Welford statistics under different naming conventions.
+            mean = gstats.get("global_mean",
+                              gstats.get("chunk_max_mean", gstats.get("mean")))
+            std = gstats.get("global_std",
+                             gstats.get("chunk_max_std", gstats.get("std")))
+            if mean is None or std is None:
+                logger.error(f"Postnorm needs (global_mean,global_std) or "
+                             f"(chunk_max_mean,chunk_max_std) or (mean,std) in "
+                             f"{args.global_stats}; got keys {list(gstats.keys())}")
+                sys.exit(1)
             valid = std > 0
             normalized = np.zeros_like(pooled_vectors)
             normalized[:, valid] = (pooled_vectors[:, valid] - mean[valid]) / std[valid]
             pooled_vectors = normalized
             logger.info(f"  Range: [{pooled_vectors.min():.4f}, {pooled_vectors.max():.4f}]")
+
+        else:
+            # Original behavior (no norm_method specified)
+            if args.global_stats and os.path.isfile(os.path.join(raw_data_dir, "maxpooled_vectors.npy")):
+                logger.info("Loading raw pooled vectors (normalization will be applied)")
+                pooled_vectors = np.load(os.path.join(raw_data_dir, "maxpooled_vectors.npy"))
+                n_regions = pooled_vectors.shape[0]
+                logger.info(f"  Loaded {n_regions} vectors from {raw_data_dir}/")
+            elif os.path.isfile(pooled_path) and not args.global_stats:
+                logger.info(f"RESUME: Cached pooled vectors found at {pooled_path}")
+                pooled_vectors = np.load(pooled_path)
+                n_regions = pooled_vectors.shape[0]
+            elif args.from_shards:
+                logger.info("Pooling from shard directories...")
+                pooled_vectors, n_regions, tsv_paths_from_shards = load_and_pool_from_shards(
+                    results_dir, args.chrom,
+                    pool_method=args.pool_method,
+                    n_shards=args.n_shards,
+                    logger=logger,
+                )
+            else:
+                npz_path = os.path.join(args.input_dir, "data", "feature_matrices.npz")
+                pooled_vectors, n_regions = load_and_pool_feature_matrices(
+                    npz_path, pool_method=args.pool_method, logger=logger
+                )
+
+            # Legacy normalization path (when --global_stats without --norm_method)
+            if args.global_stats:
+                logger.info(f"Applying genome-wide z-score normalization (legacy)")
+                gstats = dict(np.load(args.global_stats))
+                mean = gstats.get("nuc_mean", gstats.get("mean", gstats.get("cross_chrom_mean")))
+                std = gstats.get("nuc_std", gstats.get("std", gstats.get("cross_chrom_std")))
+                valid = std > 0
+                normalized = np.zeros_like(pooled_vectors)
+                normalized[:, valid] = (pooled_vectors[:, valid] - mean[valid]) / std[valid]
+                pooled_vectors = normalized
+                logger.info(f"  Range: [{pooled_vectors.min():.4f}, {pooled_vectors.max():.4f}]")
 
         # Save pooled vectors
         np.save(pooled_path, pooled_vectors)

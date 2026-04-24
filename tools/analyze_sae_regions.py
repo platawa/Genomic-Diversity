@@ -224,6 +224,7 @@ def load_and_pool_from_shards(
     pool_method: str = "max",
     n_shards: int = 36,
     logger: logging.Logger = None,
+    global_stats: str = None,
 ) -> Tuple[np.ndarray, int, List[str]]:
     """
     Load and pool feature matrices directly from shard directories,
@@ -303,6 +304,18 @@ def load_and_pool_from_shards(
     if logger:
         logger.info(f"Total regions across shards: {total_regions}. Streaming {pool_method}-pool...")
 
+    # --- Load normalization stats if pre-normalization requested ---
+    prenorm_mean = None
+    prenorm_std_safe = None
+    if global_stats:
+        gstats = dict(np.load(global_stats))
+        prenorm_mean = gstats.get("nuc_mean", gstats.get("mean")).astype(np.float32)
+        prenorm_std = gstats.get("nuc_std", gstats.get("std")).astype(np.float32)
+        prenorm_std_safe = np.where(prenorm_std > 0, prenorm_std, 1.0)
+        if logger:
+            logger.info(f"Pre-normalization enabled: nuc_mean range [{prenorm_mean.min():.4f}, {prenorm_mean.max():.4f}], "
+                        f"nuc_std range [{prenorm_std.min():.4f}, {prenorm_std.max():.4f}]")
+
     # --- Second pass: stream, pool, discard ---
     pool_fn = np.max if pool_method == "max" else np.mean
     pooled_vectors = np.zeros((total_regions, N_SAE_FEATURES), dtype=np.float32)
@@ -342,6 +355,9 @@ def load_and_pool_from_shards(
                 feature_ts = read_array(io.BytesIO(raw))
                 del raw
 
+                # Pre-normalize per nucleotide if global_stats provided
+                if prenorm_mean is not None:
+                    feature_ts = (feature_ts - prenorm_mean[np.newaxis, :]) / prenorm_std_safe[np.newaxis, :]
                 pooled = pool_fn(feature_ts, axis=0).astype(np.float32)
                 del feature_ts
 
@@ -1689,8 +1705,8 @@ Examples:
     if args.global_stats:
         logger.info(f"Applying genome-wide z-score normalization from {args.global_stats}")
         gstats = dict(np.load(args.global_stats))
-        mean = gstats.get("mean", gstats.get("cross_chrom_mean"))
-        std = gstats.get("std", gstats.get("cross_chrom_std"))
+        mean = gstats.get("nuc_mean", gstats.get("mean", gstats.get("cross_chrom_mean")))
+        std = gstats.get("nuc_std", gstats.get("std", gstats.get("cross_chrom_std")))
         valid = gstats.get("valid_mask", std > 0)
         normalized = np.zeros_like(pooled_vectors)
         normalized[:, valid] = (pooled_vectors[:, valid] - mean[valid]) / std[valid]

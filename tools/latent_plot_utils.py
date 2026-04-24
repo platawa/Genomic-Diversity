@@ -261,6 +261,41 @@ def compute_feature_firing_stats(maxpooled_vectors, top_k=5):
     return n_fired, top_k_features
 
 
+def compute_feature_firing_stats_thresholded(maxpooled_vectors, top_k=5, threshold=2.0):
+    """Z-score-aware variant of compute_feature_firing_stats.
+
+    A feature counts as "fired" when its activation is strictly greater than
+    `threshold`. For z-scored (normalized) pooled vectors, threshold=2.0 means
+    roughly "≥2σ above the per-nucleotide genome baseline", which is a
+    meaningful firing signal. For raw ReLU pools, the original
+    `compute_feature_firing_stats` (threshold = 0 / nonzero) is appropriate.
+
+    Parameters mirror compute_feature_firing_stats, plus `threshold`.
+    Returns (n_fired, top_k_features) with the same shapes.
+    """
+    n_regions, n_features = maxpooled_vectors.shape
+    fired_mask = maxpooled_vectors > threshold
+    n_fired = fired_mask.sum(axis=1)
+
+    top_k_features = []
+    for i in range(n_regions):
+        row = maxpooled_vectors[i]
+        mask = fired_mask[i]
+        if not mask.any():
+            top_k_features.append([])
+            continue
+        k = min(top_k, int(mask.sum()))
+        top_indices = np.argpartition(row, -k)[-k:]
+        top_indices = top_indices[np.argsort(row[top_indices])[::-1]]
+        features = [(int(idx), float(row[idx])) for idx in top_indices if row[idx] > threshold]
+        top_k_features.append(features)
+
+    logger.info(f"Feature firing (threshold={threshold}): {n_regions} regions, "
+                f"mean={np.mean(n_fired):.1f}, median={np.median(n_fired):.0f} "
+                f"features with activation > {threshold}")
+    return n_fired, top_k_features
+
+
 def compute_firing_threshold_counts(maxpooled_vectors, thresholds=(0.01, 0.05, 0.10)):
     """Count features that fire in >= threshold fraction of all regions.
 
@@ -330,7 +365,7 @@ def plot_continuous_scatter(coords, values, cmap, colorbar_label, title, out_pat
     """
     n = len(coords)
     if point_size is None:
-        point_size = 30 if n < 2000 else (12 if n < 10000 else 5)
+        point_size = 6
     if alpha is None:
         alpha = 0.9 if n < 2000 else (0.8 if n < 10000 else 0.7)
 

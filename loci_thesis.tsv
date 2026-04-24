@@ -1,0 +1,12 @@
+organism	chrom	start	end	name	scoring_run
+human	chr11	5220466	5232072	HBB	auto
+human	chr7	55014032	55212339	EGFR	auto
+human	chr10	127544349	127557672	NPS	auto
+human	chr8	140625293	140635087	PNOC	auto
+human	chr3	187671025	187672875	SST	auto
+human	chrX	73820651	73852723	XIST	auto
+ecoli	NC_000913.3	2817113	2817475	ssrA	20260309_122646_rc_logprobs_1gpu
+ecoli	NC_000913.3	3267072	3267450	rnpB	20260309_122646_rc_logprobs_1gpu
+ecoli	NC_000913.3	3055983	3056165	ssrS	20260309_122646_rc_logprobs_1gpu
+ecoli	NC_000913.3	476448	476561	ffs	20260309_122646_rc_logprobs_1gpu
+ecoli	NC_000913.3	2873900	2877500	CRISPR_TypeIE	20260309_122646_rc_logprobs_1gpu

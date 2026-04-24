@@ -214,14 +214,10 @@ def main():
         out_dir = os.path.join(sae_run, variant, "plots")
         os.makedirs(out_dir, exist_ok=True)
 
-        # Adaptive dot size: larger for small datasets, smaller for large
+        # Fixed dot size across all plots for visual comparability.
         n_pts = len(regions)
-        if n_pts < 2000:
-            dot_size, dot_alpha = 20, 0.7
-        elif n_pts < 10000:
-            dot_size, dot_alpha = 8, 0.6
-        else:
-            dot_size, dot_alpha = 3, 0.5
+        dot_size = 6
+        dot_alpha = 0.7 if n_pts < 2000 else (0.6 if n_pts < 10000 else 0.5)
 
         # ── Plot: t-SNE colored by annotation ──
         fig, ax = plt.subplots(figsize=(14, 12))

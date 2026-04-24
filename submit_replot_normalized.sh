@@ -7,7 +7,7 @@ for chr in chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 chr11 chr12 chr13 
         -J "nplot_${chr}" \
         -o "logs/nplot_${chr}_%j.out" \
         -e "logs/nplot_${chr}_%j.err" \
-        --wrap "cd /orcd/data/zhang_f/001/platawa/jan31_files && module load miniforge/24.3.0-0 && conda activate evo2_sep28 && python tools/plot_sae_latent.py --chrom ${chr} --results_dir results/ --normalized --plots tsne --gtf ${GTF}" \
+        --wrap "cd /orcd/data/zhang_f/001/platawa/jan31_files && module load miniforge/24.3.0-0 && conda activate evo2_sep28 && python tools/plot_sae_latent.py --chrom ${chr} --results_dir results/ --normalized --plots all --gtf ${GTF}" \
         2>&1 | awk '{print $4}')
     echo "Submitted ${chr}: ${JOB}"
 done

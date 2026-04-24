@@ -67,6 +67,7 @@ from tools.plot_tsne_by_annotation import (
 from tools.latent_plot_utils import (
     compute_distance_to_nearest_gene,
     compute_feature_firing_stats,
+    compute_feature_firing_stats_thresholded,
     compute_firing_threshold_counts,
     compute_length_stats,
     compute_region_lengths,
@@ -76,6 +77,7 @@ from tools.latent_plot_utils import (
     save_firing_stats_tsv,
     save_top_features_tsv,
 )
+from tools.exon_position_classifier import classify_to_array as classify_exon_position
 
 logger = logging.getLogger(__name__)
 
@@ -392,6 +394,39 @@ def generate_firing_threshold_plots(ca, embeddings, maxpooled_vectors, chrom, pl
             )
 
 
+def generate_exon_position_plots(ca, embeddings, gtf_path, chrom, plots_dir, data_dir):
+    """Color each region by its position class: first/middle/last/non-exon."""
+    starts = ca["genomic_start"].values
+    ends = ca["genomic_end"].values
+    classes = classify_exon_position(starts, ends, gtf_path, chrom)
+    category_map = {"first_exon": 0, "middle_exon": 1, "last_exon": 2, "non_exon": 3}
+    numeric = np.array([category_map.get(c, 3) for c in classes])
+    # Save TSV alongside other metadata
+    pd.DataFrame({
+        "region_idx": np.arange(len(classes)),
+        "genomic_start": starts,
+        "genomic_end": ends,
+        "exon_position": classes,
+    }).to_csv(os.path.join(data_dir, "exon_position.tsv"), sep="\t", index=False)
+
+    cmap = plt.get_cmap("Set1")
+    for emb_name, coords in embeddings.items():
+        if coords is None:
+            continue
+        fig, ax = plt.subplots(figsize=(9, 7))
+        for label, val in category_map.items():
+            mask = numeric == val
+            if not mask.any():
+                continue
+            ax.scatter(coords[mask, 0], coords[mask, 1],
+                       s=4, color=cmap(val), alpha=0.7, label=label)
+        ax.set_title(f"{emb_name.upper()} — exon position ({chrom}, N={len(ca)})")
+        ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(os.path.join(plots_dir, f"{emb_name}_by_exon_position.png"), dpi=110)
+        plt.close(fig)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Genome-wide mode
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -536,6 +571,44 @@ def run_genome_wide(args, plot_types):
     if "firing_thresholds" in plot_types:
         generate_firing_threshold_plots(ca, embeddings, mp, label, plots_dir)
 
+    if "exon_position" in plot_types:
+        logger.info("=== Exon Position (genome-wide, per-chrom GTF lookup) ===")
+        unique_chroms = ca["chrom"].unique() if "chrom" in ca.columns else []
+        classes_full = np.full(len(ca), "non_exon", dtype=object)
+        for chrom in unique_chroms:
+            mask = (ca["chrom"] == chrom).values
+            chrom_id = resolve_chrom_id_for_gtf(chrom)
+            cl = classify_exon_position(
+                ca.loc[mask, "genomic_start"].values,
+                ca.loc[mask, "genomic_end"].values,
+                args.gtf, chrom_id
+            )
+            classes_full[mask] = cl
+        category_map = {"first_exon": 0, "middle_exon": 1, "last_exon": 2, "non_exon": 3}
+        numeric = np.array([category_map.get(c, 3) for c in classes_full])
+        pd.DataFrame({
+            "chrom": ca.get("chrom", ""),
+            "genomic_start": ca["genomic_start"].values,
+            "genomic_end": ca["genomic_end"].values,
+            "exon_position": classes_full,
+        }).to_csv(os.path.join(data_dir, "exon_position.tsv"), sep="\t", index=False)
+        cmap = plt.get_cmap("Set1")
+        for emb_name, coords in embeddings.items():
+            if coords is None:
+                continue
+            fig, ax = plt.subplots(figsize=(9, 7))
+            for name, val in category_map.items():
+                m = numeric == val
+                if not m.any():
+                    continue
+                ax.scatter(coords[m, 0], coords[m, 1],
+                           s=3, color=cmap(val), alpha=0.6, label=name)
+            ax.set_title(f"{emb_name.upper()} — exon position ({label})")
+            ax.legend(loc="best", fontsize=8)
+            fig.tight_layout()
+            fig.savefig(os.path.join(plots_dir, f"{emb_name}_by_exon_position.png"), dpi=110)
+            plt.close(fig)
+
     logger.info(f"\nGenome-wide enhanced plots saved to: {output_dir}")
 
 
@@ -564,6 +637,15 @@ def run_single_chrom(args, chrom, plot_types):
         return False
 
     ca = data["cluster_assignments"]
+    mp = data["maxpooled_vectors"]
+
+    # Guard: maxpooled_vectors may have more rows than cluster_assignments
+    # (e.g., prenorm pooling used all regions but clustering used a subset)
+    if mp is not None and len(mp) != len(ca):
+        logger.warning(f"maxpooled_vectors ({len(mp)}) != cluster_assignments ({len(ca)}), "
+                       f"truncating maxpooled_vectors to match")
+        data["maxpooled_vectors"] = mp[:len(ca)]
+
     embeddings = {}
     if data["embedding_tsne"] is not None:
         embeddings["tsne"] = data["embedding_tsne"]
@@ -617,6 +699,11 @@ def run_single_chrom(args, chrom, plot_types):
         generate_firing_threshold_plots(ca, embeddings, data["maxpooled_vectors"],
                                         chrom, plots_dir)
 
+    if "exon_position" in plot_types:
+        logger.info("--- Exon Position (first/middle/last) ---")
+        generate_exon_position_plots(ca, embeddings, args.gtf, chrom,
+                                     plots_dir, data_dir_out)
+
     logger.info(f"Done: {chrom} → {plots_dir}")
     return True
 
@@ -647,7 +734,8 @@ def main():
                         help="Path to drop_boundaries.tsv (auto-discovered if omitted)")
     parser.add_argument("--plots", type=str,
                         default="distance_to_gene,entropy_color,length_stats,"
-                                "top_features,firing_counts,firing_thresholds",
+                                "top_features,firing_counts,firing_thresholds,"
+                                "exon_position",
                         help="Comma-separated plot types to generate")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Override output directory")

@@ -89,6 +89,17 @@ from tools.plot_tsne_by_annotation import (
 
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot-styling constants (used by every plotting function below to keep
+# prenorm/postnorm/raw outputs visually consistent).
+# ─────────────────────────────────────────────────────────────────────────────
+FIGSIZE_SINGLE = (8, 7)       # single-panel figures
+FIGSIZE_DOUBLE = (14, 7)      # two-panel side-by-side figures
+DPI = 200
+TITLE_FONTSIZE = 13
+AXIS_FONTSIZE = 11
+LEGEND_FONTSIZE = 9
+
 
 def setup_logging(level="INFO"):
     logging.basicConfig(
@@ -135,22 +146,43 @@ def parse_args():
     return parser.parse_args()
 
 
+def _auto_point_size(n):
+    """Auto-scale scatter point size based on number of points."""
+    if n < 2000: return 30
+    if n < 10000: return 12
+    if n < 100000: return 5
+    return 1
+
+
+def _auto_alpha(n):
+    """Auto-scale scatter alpha based on number of points."""
+    if n < 2000: return 0.7
+    if n < 10000: return 0.6
+    if n < 100000: return 0.4
+    return 0.3
+
+
 def plot_embedding(coords, labels, colors, order, title, xlabel, ylabel,
-                   out_path, point_size=15, alpha=0.7):
+                   out_path, point_size=None, alpha=None):
     """Plot a 2D scatter colored by categorical labels."""
-    fig, ax = plt.subplots(figsize=(8, 6))
+    if point_size is None:
+        point_size = _auto_point_size(len(coords))
+    if alpha is None:
+        alpha = _auto_alpha(len(coords))
+    fig, ax = plt.subplots(figsize=FIGSIZE_SINGLE)
     for label in order:
         mask = np.array([l == label for l in labels])
         if mask.any():
             ax.scatter(coords[mask, 0], coords[mask, 1],
                        c=colors[label], label=f"{label} ({mask.sum()})",
-                       s=point_size, alpha=alpha, edgecolors="none")
-    ax.legend(fontsize=10, markerscale=2)
-    ax.set_title(title, fontsize=13)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+                       s=point_size, alpha=alpha, edgecolors="none",
+                       rasterized=True)
+    ax.legend(fontsize=LEGEND_FONTSIZE, markerscale=2)
+    ax.set_title(title, fontsize=TITLE_FONTSIZE)
+    ax.set_xlabel(xlabel, fontsize=AXIS_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
     logger.info(f"Saved: {out_path}")
     plt.close()
 
@@ -159,7 +191,9 @@ def plot_annotation_and_confidence(coords, annotations, confidences,
                                    annotation_colors, annotation_order,
                                    title, xlabel, ylabel, out_path):
     """Side-by-side: annotation colors + confidence colormap."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    ps = _auto_point_size(len(coords))
+    al = _auto_alpha(len(coords))
+    fig, axes = plt.subplots(1, 2, figsize=FIGSIZE_DOUBLE)
 
     # Left: annotation
     ax = axes[0]
@@ -169,25 +203,25 @@ def plot_annotation_and_confidence(coords, annotations, confidences,
             ax.scatter(coords[mask, 0], coords[mask, 1],
                        c=annotation_colors[label],
                        label=f"{label} ({mask.sum()})",
-                       s=15, alpha=0.7, edgecolors="none")
-    ax.legend(fontsize=10, markerscale=2)
-    ax.set_title("Genomic Annotation")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+                       s=ps, alpha=al, edgecolors="none", rasterized=True)
+    ax.legend(fontsize=LEGEND_FONTSIZE, markerscale=2)
+    ax.set_title("Genomic Annotation", fontsize=TITLE_FONTSIZE)
+    ax.set_xlabel(xlabel, fontsize=AXIS_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
 
     # Right: confidence
     ax = axes[1]
     sc = ax.scatter(coords[:, 0], coords[:, 1],
                     c=confidences, cmap="viridis",
-                    s=15, alpha=0.7, edgecolors="none")
+                    s=ps, alpha=al, edgecolors="none", rasterized=True)
     plt.colorbar(sc, ax=ax, label="Confidence")
-    ax.set_title("Detection Confidence")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+    ax.set_title("Detection Confidence", fontsize=TITLE_FONTSIZE)
+    ax.set_xlabel(xlabel, fontsize=AXIS_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
 
-    fig.suptitle(title, fontsize=14, y=1.01)
+    fig.suptitle(title, fontsize=TITLE_FONTSIZE + 1, y=1.01)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
     logger.info(f"Saved: {out_path}")
     plt.close()
 
@@ -200,39 +234,44 @@ def plot_by_chromosome(coords, chrom_labels, title, xlabel, ylabel, out_path):
     cmap = plt.cm.get_cmap("tab20", len(unique_chroms))
     chrom_to_color = {c: cmap(i) for i, c in enumerate(unique_chroms)}
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    ps = _auto_point_size(len(coords))
+    al = _auto_alpha(len(coords))
+    fig, ax = plt.subplots(figsize=FIGSIZE_SINGLE)
     for chrom in unique_chroms:
         mask = np.array([c == chrom for c in chrom_labels])
         ax.scatter(coords[mask, 0], coords[mask, 1],
                    c=[chrom_to_color[chrom]], label=f"{chrom} ({mask.sum()})",
-                   s=15, alpha=0.6, edgecolors="none")
-    ax.legend(fontsize=8, markerscale=2, ncol=2, loc="best")
-    ax.set_title(title, fontsize=13)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+                   s=ps, alpha=al, edgecolors="none", rasterized=True)
+    ax.legend(fontsize=LEGEND_FONTSIZE - 1, markerscale=2, ncol=2, loc="best")
+    ax.set_title(title, fontsize=TITLE_FONTSIZE)
+    ax.set_xlabel(xlabel, fontsize=AXIS_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
     logger.info(f"Saved: {out_path}")
     plt.close()
 
 
 def plot_single_annotation(coords, annotations, annotation_type, annotation_colors,
-                           title, xlabel, ylabel, out_path, point_size=15):
+                           title, xlabel, ylabel, out_path, point_size=None):
     """Plot single annotation type only."""
     mask = np.array([a == annotation_type for a in annotations])
     if not mask.any():
         logger.warning(f"No regions with annotation '{annotation_type}'")
         return
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    if point_size is None:
+        point_size = _auto_point_size(mask.sum())
+    fig, ax = plt.subplots(figsize=FIGSIZE_SINGLE)
     ax.scatter(coords[mask, 0], coords[mask, 1],
                c=annotation_colors.get(annotation_type, "#999999"),
-               s=point_size, alpha=0.7, edgecolors="none")
-    ax.set_title(title, fontsize=13)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+               s=point_size, alpha=_auto_alpha(mask.sum()), edgecolors="none",
+               rasterized=True)
+    ax.set_title(title, fontsize=TITLE_FONTSIZE)
+    ax.set_xlabel(xlabel, fontsize=AXIS_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
     logger.info(f"Saved: {out_path}")
     plt.close()
 
@@ -244,20 +283,22 @@ def plot_by_method(coords, methods, title, xlabel, ylabel, out_path):
         "MAD": "#3498db",
     }
     unique_methods = sorted(set(methods))
+    ps = _auto_point_size(len(coords))
+    al = _auto_alpha(len(coords))
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=FIGSIZE_SINGLE)
     for method in unique_methods:
         mask = np.array([m == method for m in methods])
         ax.scatter(coords[mask, 0], coords[mask, 1],
                    c=method_colors.get(method, "#999999"),
                    label=f"{method} ({mask.sum()})",
-                   s=15, alpha=0.7, edgecolors="none")
-    ax.legend(fontsize=10, markerscale=2)
-    ax.set_title(title, fontsize=13)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+                   s=ps, alpha=al, edgecolors="none", rasterized=True)
+    ax.legend(fontsize=LEGEND_FONTSIZE, markerscale=2)
+    ax.set_title(title, fontsize=TITLE_FONTSIZE)
+    ax.set_xlabel(xlabel, fontsize=AXIS_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
     logger.info(f"Saved: {out_path}")
     plt.close()
 
@@ -267,19 +308,32 @@ def plot_by_cluster(coords, clusters, title, xlabel, ylabel, out_path):
     unique_clusters = sorted(np.unique(clusters))
     cmap = plt.cm.get_cmap("tab20" if len(unique_clusters) <= 10 else "tab20b")
     cluster_colors = {c: cmap(i % 20) for i, c in enumerate(unique_clusters)}
+    ps = _auto_point_size(len(coords))
+    al = _auto_alpha(len(coords))
+    # Suppress per-cluster legend when there are too many clusters (e.g. 495
+    # from 897K regions): it would overwhelm the figure. Dense colored points
+    # carry the signal; reader can consult cluster_assignments.tsv for labels.
+    show_legend = len(unique_clusters) <= 30
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=FIGSIZE_SINGLE)
     for c in unique_clusters:
         mask = clusters == c
+        label = f"Cluster {c} ({mask.sum()})" if show_legend else None
         ax.scatter(coords[mask, 0], coords[mask, 1],
-                   c=[cluster_colors[c]], label=f"Cluster {c} ({mask.sum()})",
-                   s=15, alpha=0.7, edgecolors="none")
-    ax.legend(fontsize=8, markerscale=2, ncol=2, loc="best")
-    ax.set_title(title, fontsize=13)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+                   c=[cluster_colors[c]], label=label,
+                   s=ps, alpha=al, edgecolors="none", rasterized=True)
+    if show_legend:
+        ax.legend(fontsize=LEGEND_FONTSIZE - 1, markerscale=2, ncol=2, loc="best")
+    else:
+        ax.text(0.02, 0.98, f"{len(unique_clusters)} clusters (legend omitted)",
+                transform=ax.transAxes, fontsize=LEGEND_FONTSIZE,
+                verticalalignment="top",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+    ax.set_title(title, fontsize=TITLE_FONTSIZE)
+    ax.set_xlabel(xlabel, fontsize=AXIS_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
     logger.info(f"Saved: {out_path}")
     plt.close()
 
@@ -287,31 +341,33 @@ def plot_by_cluster(coords, clusters, title, xlabel, ylabel, out_path):
 def plot_continuous_colormaps(coords, confidences, region_lengths, title,
                                xlabel, ylabel, out_path):
     """Side-by-side: confidence and region length colormaps."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    ps = _auto_point_size(len(coords))
+    al = _auto_alpha(len(coords))
+    fig, axes = plt.subplots(1, 2, figsize=FIGSIZE_DOUBLE)
 
     # Confidence
     ax = axes[0]
     sc1 = ax.scatter(coords[:, 0], coords[:, 1],
                      c=confidences, cmap="viridis",
-                     s=15, alpha=0.7, edgecolors="none")
+                     s=ps, alpha=al, edgecolors="none", rasterized=True)
     plt.colorbar(sc1, ax=ax, label="Confidence")
-    ax.set_title("Colored by Confidence")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+    ax.set_title("Colored by Confidence", fontsize=TITLE_FONTSIZE)
+    ax.set_xlabel(xlabel, fontsize=AXIS_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
 
     # Region length
     ax = axes[1]
     sc2 = ax.scatter(coords[:, 0], coords[:, 1],
                      c=region_lengths, cmap="plasma",
-                     s=15, alpha=0.7, edgecolors="none")
+                     s=ps, alpha=al, edgecolors="none", rasterized=True)
     plt.colorbar(sc2, ax=ax, label="Region Length (bp)")
-    ax.set_title("Colored by Region Length")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+    ax.set_title("Colored by Region Length", fontsize=TITLE_FONTSIZE)
+    ax.set_xlabel(xlabel, fontsize=AXIS_FONTSIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_FONTSIZE)
 
-    fig.suptitle(title, fontsize=14, y=1.00)
+    fig.suptitle(title, fontsize=TITLE_FONTSIZE + 1, y=1.00)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
     logger.info(f"Saved: {out_path}")
     plt.close()
 
