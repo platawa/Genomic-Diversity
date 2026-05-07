@@ -68,3 +68,12 @@ npz_test_results.txt
 
 # Patch files
 *.patch
+
+# Personal thesis tracking (local-only)
+THESIS_TODO.md
+thesis_repo_notes/
+EXPERIMENTS_INVENTORY.md
+
+# Local plot renders (regenerable)
+_firing_pct_table_renders/
+_locus_overview/
