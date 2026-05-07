@@ -197,9 +197,9 @@ def compose_fig_4_1(data, out_path):
 def compose_fig_4_2(data_panels, out_path):
     """4-panel contrasting loci: EGFR / NPS / CRISPR / TIGR-Tas (or panel D stub)."""
     n = len(data_panels)
-    fig = plt.figure(figsize=(14, 3.2 * n))
-    gs = gridspec.GridSpec(n * 2, 1,
-                           height_ratios=[4, 1] * n, hspace=0.25)
+    fig = plt.figure(figsize=(11, 3.0 * n), constrained_layout=True)
+    gs = gridspec.GridSpec(n * 2, 1, height_ratios=[4, 1] * n,
+                           hspace=0.08, figure=fig)
     for i, (label, data) in enumerate(data_panels):
         ax_ent = fig.add_subplot(gs[2 * i])
         ax_ann = fig.add_subplot(gs[2 * i + 1], sharex=ax_ent)
@@ -209,8 +209,11 @@ def compose_fig_4_2(data_panels, out_path):
                         fontsize=11, color="gray")
             ax_ent.set_xticks([]); ax_ent.set_yticks([])
             ax_ann.set_xticks([]); ax_ann.set_yticks([])
+            for s in ax_ent.spines.values(): s.set_visible(False)
+            for s in ax_ann.spines.values(): s.set_visible(False)
             continue
-        title = f"({label}) {data['row']['name']} — {data['row']['chrom']}"
+        title = f"({label}) {data['row']['name']} — {data['row']['chrom']}:" \
+                f"{data['row']['start']:,}-{data['row']['end']:,}"
         draw_entropy_panel(ax_ent, data["pos"], data["raw"], data["smoothed"],
                            [("zscore", data["drops"]["zscore"], "#d62728"),
                             ("mad",    data["drops"]["mad"],    "#9467bd")],
@@ -218,6 +221,9 @@ def compose_fig_4_2(data_panels, out_path):
         draw_annotation_ribbon(ax_ann, data["features"],
                                data["row"]["start"], data["row"]["end"], pad=0)
         ax_ann.set_xlim(ax_ent.get_xlim())
+        # Turn off scientific-notation offset on x-axis ticks
+        ax_ent.ticklabel_format(axis="x", useOffset=False, style="plain")
+        ax_ann.ticklabel_format(axis="x", useOffset=False, style="plain")
 
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -266,15 +272,38 @@ def compose_fig_4_3(data, methods, out_path):
     logger.info(f"Wrote {out_path}")
 
 
-# ---------- load drops for all 6 methods (fig 4.3 needs these) ----------
+# ---------- compute drops for all 6 methods on-the-fly (fig 4.3 needs these) ----------
 
-def load_drops_all_methods(row, results_dir, pad):
-    run_dir = resolve_scoring_run(results_dir, row["chrom"], row.get("scoring_run", "auto"))
-    if run_dir is None:
-        return {}
+def compute_drops_all_methods(data, pad):
+    """Run all 6 detection methods on the locus entropy slice.
+    Returns {method_name: DataFrame({genomic_pos, confidence})} for each.
+
+    Uses detection_methods.run_method() on data['pos']+data['raw']; positions
+    from run_method are local to the slice, translated to genomic coords.
+    """
+    # Import lazily so non-Fig-4.3 paths don't need detection_methods available
+    from detection_methods import run_method
+
     methods = ["zscore", "mad", "derivative", "cusum",
                "window_mean_shift", "local_baseline"]
-    return {m: load_drops(run_dir, m, row["start"], row["end"], pad) for m in methods}
+    drops = {}
+    pos_arr = data["pos"]
+    raw = data["raw"]
+    origin = int(pos_arr[0])  # first genomic position in the slice
+    for method in methods:
+        try:
+            calls = run_method(method, raw)  # list of (local_pos, score)
+        except Exception as exc:
+            logger.warning(f"method {method} failed: {exc}")
+            drops[method] = pd.DataFrame(columns=["genomic_pos", "confidence"])
+            continue
+        if not calls:
+            drops[method] = pd.DataFrame(columns=["genomic_pos", "confidence"])
+            continue
+        df = pd.DataFrame(calls, columns=["local_pos", "confidence"])
+        df["genomic_pos"] = df["local_pos"].astype(int) + origin
+        drops[method] = df[["genomic_pos", "confidence"]]
+    return drops
 
 
 # ---------- main ----------
@@ -342,8 +371,9 @@ def main():
         data = load_locus_data(row, args.results_dir, gtf_map.get(row["organism"]),
                                args.pad, args.smooth_window)
         if data is not None:
-            # Load all 6 methods
-            data["drops"] = load_drops_all_methods(row, args.results_dir, args.pad)
+            # Compute all 6 methods on-the-fly from the entropy slice
+            # (drops.tsv only contains zscore+mad; others aren't dispatched at scoring time)
+            data["drops"] = compute_drops_all_methods(data, args.pad)
             methods = ["zscore", "mad", "derivative",
                        "cusum", "window_mean_shift", "local_baseline"]
             compose_fig_4_3(data, methods,

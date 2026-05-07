@@ -171,6 +171,125 @@ def classify_to_array(region_starts, region_ends, gtf_path, chrom_id):
     return np.array([r["class"] for r in records])
 
 
+def parse_gtf_exons_all(gtf_path, wanted_chroms):
+    """Single-pass GTF scan that returns dict[chrom] -> transcripts dict.
+
+    Same semantics as parse_gtf_exons() but collects every chromosome in
+    `wanted_chroms` in one file traversal. Strand-aware fill-in of missing
+    exon_number matches parse_gtf_exons().
+    """
+    wanted = set(wanted_chroms)
+    by_chrom = {c: defaultdict(list) for c in wanted}
+    with open(gtf_path) as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 9 or parts[2] != "exon":
+                continue
+            chrom = parts[0]
+            if chrom not in wanted:
+                continue
+            start, end, strand = int(parts[3]), int(parts[4]), parts[6]
+            attrs = parts[8]
+            tid = None
+            enum = None
+            for field in attrs.split(";"):
+                field = field.strip()
+                if field.startswith("transcript_id"):
+                    tid = field.split('"')[1] if '"' in field else field.split()[-1]
+                elif field.startswith("exon_number"):
+                    token = field.split('"')[1] if '"' in field else field.split()[-1]
+                    try:
+                        enum = int(token)
+                    except ValueError:
+                        enum = None
+            if tid is None:
+                continue
+            by_chrom[chrom][tid].append((enum, start, end, strand))
+    for chrom, transcripts in by_chrom.items():
+        for tid, exons in list(transcripts.items()):
+            if any(e[0] is None for e in exons):
+                strand = exons[0][3]
+                sorted_exons = sorted(exons, key=lambda e: e[1],
+                                      reverse=(strand == "-"))
+                transcripts[tid] = [(i + 1, s, e, st)
+                                    for i, (_, s, e, st) in enumerate(sorted_exons)]
+            else:
+                transcripts[tid] = sorted(exons, key=lambda e: e[0])
+    return by_chrom
+
+
+def classify_all_chroms_once(gtf_path, chrom_values, region_starts, region_ends):
+    """Classify every region in one pass over the GTF.
+
+    Groups regions by chrom, scans the GTF a single time (collecting exons for
+    all referenced chroms), then classifies each group via classify_regions().
+
+    Args:
+        gtf_path: path to genomic.gtf.
+        chrom_values: array-like of N chromosome names as they appear in
+            cluster_assignments.tsv (e.g. "chr22" or "NC_000022.11").
+        region_starts, region_ends: length-N arrays of 1-based inclusive coords.
+
+    Returns:
+        list of N classification dicts (same shape as classify_regions()),
+        in the original row order.
+    """
+    chrom_values = np.asarray(chrom_values)
+    region_starts = np.asarray(region_starts)
+    region_ends = np.asarray(region_ends)
+    n = len(chrom_values)
+    if not (n == len(region_starts) == len(region_ends)):
+        raise ValueError("chrom/start/end arrays must have equal length")
+
+    unique_chroms = list({str(c) for c in chrom_values})
+    wanted = set()
+    for c in unique_chroms:
+        wanted.add(c)
+        wanted.add(resolve_chrom_id_for_gtf(c))
+        if c.startswith("chr"):
+            wanted.add(c[3:])
+        else:
+            wanted.add(f"chr{c}")
+
+    logger.info(f"Scanning GTF for {len(unique_chroms)} chroms "
+                f"({len(wanted)} accepted aliases) in one pass...")
+    by_chrom = parse_gtf_exons_all(gtf_path, wanted)
+
+    records = [None] * n
+    for chrom_name in unique_chroms:
+        mask = chrom_values == chrom_name
+        idx_list = np.where(mask)[0]
+        if len(idx_list) == 0:
+            continue
+        candidates = [chrom_name, resolve_chrom_id_for_gtf(chrom_name)]
+        if chrom_name.startswith("chr"):
+            candidates.append(chrom_name[3:])
+        else:
+            candidates.append(f"chr{chrom_name}")
+        transcripts = None
+        for k in candidates:
+            if k in by_chrom and by_chrom[k]:
+                transcripts = by_chrom[k]
+                break
+        if not transcripts:
+            logger.warning(f"No exons in GTF for {chrom_name} "
+                           f"({len(idx_list)} regions -> non_exon)")
+            for idx in idx_list:
+                records[idx] = {
+                    "class": "non_exon", "transcript_id": "",
+                    "exon_index": 0, "n_exons": 0,
+                    "center_dist_to_exon": -1.0,
+                }
+            continue
+        chrom_records = classify_regions(
+            region_starts[mask], region_ends[mask], transcripts)
+        for out_idx, src_idx in enumerate(idx_list):
+            records[src_idx] = chrom_records[out_idx]
+    return records
+
+
 def main():
     p = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
                                 description=__doc__)

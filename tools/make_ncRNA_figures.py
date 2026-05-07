@@ -117,7 +117,8 @@ def load_gtf_exons(gtf_path, chrom, start, end, pad):
             if line.startswith("#"):
                 continue
             parts = line.split("\t")
-            if len(parts) < 9 or parts[2] != "exon":
+            # Accept exon (eukaryotes) or CDS (bacteria frequently lack exon rows)
+            if len(parts) < 9 or parts[2] not in ("exon", "CDS"):
                 continue
             if not chrom_matches(parts[0], chrom):
                 continue
